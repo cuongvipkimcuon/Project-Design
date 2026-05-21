@@ -523,10 +523,17 @@ class ExcelParser:
         self.db = db
 
     def load_bom_ke(self, file_path: str) -> pd.DataFrame:
+        try:
+            from core.bom_ke_reader import BomKeReaderService
+            from core.database import HubDatabase
+
+            result = BomKeReaderService(HubDatabase()).load(file_path, force=False)
+            return result.df
+        except Exception:
+            pass
         if not Path(file_path).exists():
             raise FileNotFoundError(f"Khong tim thay bang ke: {file_path}")
         file_hash = compute_file_signature(file_path)
-        # Bump cache key version when parse schema changes to avoid stale cached data.
         cache_key = "BOM_KE_V3"
         cached = self.db.get_cache(file_path, cache_key)
         if cached and cached[0] == file_hash:

@@ -11,8 +11,11 @@ import customtkinter as ctk
 
 from check_bom import DatabaseManager as BomDatabaseManager
 from core.app_state import AppState
+from core.bom_ke_reader import BomKeReaderService
 from core.utils import normalize_text
 from ui.theme import COLORS, FONT_BODY, FONT_SMALL, FONT_SUB
+
+_SHOW_CUSTOMER_UI = False
 
 
 class SetupPanel(ctk.CTkScrollableFrame):
@@ -20,6 +23,7 @@ class SetupPanel(ctk.CTkScrollableFrame):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.state = state
         self.bom_db = BomDatabaseManager()
+        self.bom_ke_service = BomKeReaderService(state.db)
         self._build()
 
     def _section(self, title: str) -> ctk.CTkFrame:
@@ -79,8 +83,37 @@ class SetupPanel(ctk.CTkScrollableFrame):
         brow2.pack(fill="x", pady=6)
         ctk.CTkButton(brow2, text="Chọn file", width=100, command=self._pick_bom).pack(side="left")
         ctk.CTkButton(brow2, text="Lưu link", width=100, command=self._save_bom_link).pack(side="left", padx=8)
+        ctk.CTkButton(
+            brow2,
+            text="Đọc",
+            width=100,
+            fg_color=COLORS["accent"][1],
+            command=self._read_bom_ke,
+        ).pack(side="left", padx=8)
+        self.bom_status_label = ctk.CTkLabel(brow2, text="—", font=FONT_BODY)
+        self.bom_status_label.pack(side="left", padx=12)
+        self._refresh_bom_status()
 
-        # --- Khách hàng ---
+        if _SHOW_CUSTOMER_UI:
+            self._build_customer_section()
+
+        # --- EMG Scanner JSON ---
+        emg = self._section("EMG Scanner — file JSON")
+        default_emg = str(Path(__file__).resolve().parents[1] / "emg_scanner_export.json")
+        saved = self.state.db.get_setup("emg_scanner_json_path", default_emg)
+        self.emg_path_var = ctk.StringVar(value=saved)
+        ctk.CTkEntry(emg, textvariable=self.emg_path_var, placeholder_text="emg_scanner_export.json").pack(
+            fill="x", pady=4
+        )
+        erow = ctk.CTkFrame(emg, fg_color="transparent")
+        erow.pack(fill="x", pady=6)
+        ctk.CTkButton(erow, text="Chọn file", width=100, command=self._pick_emg).pack(side="left")
+        ctk.CTkButton(erow, text="Lưu link", width=100, command=self._save_emg).pack(side="left", padx=8)
+        self.emg_status = ctk.CTkLabel(erow, text="", font=FONT_SMALL, text_color=COLORS["muted"])
+        self.emg_status.pack(side="left", padx=8)
+        self._check_emg_path()
+
+    def _build_customer_section(self) -> None:
         kh = self._section("Khách hàng & thư mục phần (Check BOM)")
         ctk.CTkLabel(
             kh,
@@ -100,21 +133,27 @@ class SetupPanel(ctk.CTkScrollableFrame):
         self._selected_customer_id: int | None = None
         self._reload_customers()
 
-        # --- EMG Scanner JSON ---
-        emg = self._section("EMG Scanner — file JSON")
-        default_emg = str(Path(__file__).resolve().parents[1] / "emg_scanner_export.json")
-        saved = self.state.db.get_setup("emg_scanner_json_path", default_emg)
-        self.emg_path_var = ctk.StringVar(value=saved)
-        ctk.CTkEntry(emg, textvariable=self.emg_path_var, placeholder_text="emg_scanner_export.json").pack(
-            fill="x", pady=4
-        )
-        erow = ctk.CTkFrame(emg, fg_color="transparent")
-        erow.pack(fill="x", pady=6)
-        ctk.CTkButton(erow, text="Chọn file", width=100, command=self._pick_emg).pack(side="left")
-        ctk.CTkButton(erow, text="Lưu link", width=100, command=self._save_emg).pack(side="left", padx=8)
-        self.emg_status = ctk.CTkLabel(erow, text="", font=FONT_SMALL, text_color=COLORS["muted"])
-        self.emg_status.pack(side="left", padx=8)
-        self._check_emg_path()
+    def _refresh_bom_status(self) -> None:
+        a6_hash = self.state.db.get_setup("bom_ke_a6_hash", "")
+        a6_text = self.state.db.get_setup("bom_ke_a6_text", "")
+        meta = self.state.db.get_bom_ke_dataset(a6_hash) if a6_hash else None
+        if self.state.bom_ke_ok and meta:
+            short = a6_text[:42] + "…" if len(a6_text) > 42 else a6_text
+            self.bom_status_label.configure(
+                text=f"✓ OK — {meta['row_count']} dòng | A6: {short}",
+                text_color=COLORS["success"][1],
+            )
+        elif meta:
+            short = a6_text[:42] + "…" if len(a6_text) > 42 else a6_text
+            self.bom_status_label.configure(
+                text=f"✓ Cache — {meta['row_count']} dòng | A6: {short}",
+                text_color=COLORS["success"][1],
+            )
+        else:
+            self.bom_status_label.configure(
+                text="Chưa đọc bảng kê",
+                text_color=COLORS["warning"][1],
+            )
 
     def _refresh_ol_status(self) -> None:
         today = date.today().strftime("%Y-%m-%d")
@@ -187,7 +226,35 @@ class SetupPanel(ctk.CTkScrollableFrame):
             messagebox.showwarning("Setup", "Chọn file bảng kê.")
             return
         self.bom_db.set_setup_value("bom_link", path)
+        self.state.db.set_setup("bom_ke_file_path", path)
         messagebox.showinfo("Setup", "Đã lưu link bảng kê.")
+
+    def _read_bom_ke(self) -> None:
+        path = self.bom_link_var.get().strip()
+        if not path:
+            messagebox.showwarning("Bảng kê", "Chọn file bảng kê trước.")
+            return
+        self.bom_status_label.configure(text="Đang đọc…", text_color=COLORS["muted"][1])
+        self.bom_db.set_setup_value("bom_link", path)
+
+        def worker() -> None:
+            try:
+                result = self.bom_ke_service.load(path, force=False)
+                self.after(0, lambda: self._on_bom_done(result))
+            except Exception as exc:
+                self.after(0, lambda: self._on_bom_fail(str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_bom_done(self, result) -> None:
+        self.state.set_bom_ke_result(result)
+        self._refresh_bom_status()
+        messagebox.showinfo("Bảng kê", result.message)
+
+    def _on_bom_fail(self, msg: str) -> None:
+        self.state.set_bom_ke_error(msg)
+        self.bom_status_label.configure(text=f"✗ {msg}", text_color="#e57373")
+        messagebox.showerror("Bảng kê", msg)
 
     def _reload_customers(self) -> None:
         rows = self.bom_db.get_customers()

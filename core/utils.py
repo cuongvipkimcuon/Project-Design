@@ -58,6 +58,11 @@ def compute_file_signature(file_path: str) -> str:
     return f"stat:{st.st_size}:{st.st_mtime_ns}"
 
 
+def hash_text(value: object) -> str:
+    text = normalize_text(value)
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
 def compute_file_md5(file_path: str) -> str:
     md5 = hashlib.md5()
     with open(file_path, "rb") as f:

@@ -62,13 +62,14 @@ OL_COLUMNS = [
 
 @dataclass
 class OlLoadResult:
-    source: str  # "cache_today" | "cache_snapshot" | "parsed"
+    source: str  # "cache_file" | "cache_snapshot" | "parsed" | "active_dataset"
     snapshot_date: str
     file_path: str
     file_hash: str
     row_count: int
     message: str
     df: pd.DataFrame
+    dataset_id: int | None = None
 
 
 class OlReaderService:
@@ -146,44 +147,104 @@ class OlReaderService:
         force: bool = False,
         snapshot_date: str | None = None,
     ) -> OlLoadResult:
-        """Đọc OL cho ngày snapshot (mặc định hôm nay). Mỗi ngày 1 snapshot; hash file tránh đọc lại."""
+        """Đọc OL cho ngày snapshot (mặc định hôm nay). Cache theo tên file + hash."""
         path = str(Path(file_path).resolve())
+        file_name = Path(path).name
         snap = snapshot_date or date.today().strftime("%Y-%m-%d")
         file_hash = compute_file_signature(path)
 
         if not force:
+            cached = self.db.get_ol_dataset(file_name, file_hash)
+            if cached:
+                df = self.db.load_ol_dataset_df(file_name, file_hash)
+                if df is not None:
+                    self.db.save_snapshot(snap, path, file_hash, df)
+                    return self._finish_ol_load(
+                        source="cache_file",
+                        snapshot_date=snap,
+                        file_path=path,
+                        file_hash=file_hash,
+                        df=df,
+                        file_name=file_name,
+                        cache_note=f"Dùng cache OL theo file '{file_name}'",
+                    )
+
             meta = self.db.get_snapshot_meta(snap)
             if meta and meta[2] == path and meta[3] == file_hash:
                 df = self.db.load_snapshot_df(snap)
                 if df is not None:
-                    return OlLoadResult(
+                    return self._finish_ol_load(
                         source="cache_snapshot",
                         snapshot_date=snap,
                         file_path=path,
                         file_hash=file_hash,
-                        row_count=len(df),
-                        message=f"Dùng cache ngày {snap} (file không đổi).",
                         df=df,
+                        file_name=file_name,
+                        cache_note=f"Dùng snapshot ngày {snap} (file không đổi)",
                     )
-
-            stored_hash = self.db.get_file_hash(path)
-            if stored_hash == file_hash and meta is None:
-                # Cùng file đã đọc trước đó nhưng chưa có snapshot hôm nay — vẫn parse nếu cần snapshot mới
-                pass
 
         df = self.parse_ol_excel(path)
         self.db.save_snapshot(snap, path, file_hash, df)
         self.db.set_file_hash(path, file_hash)
         self.db.set_setup("ol_file_path", path)
+        self.db.set_setup("ol_file_name", file_name)
 
-        return OlLoadResult(
+        return self._finish_ol_load(
             source="parsed",
             snapshot_date=snap,
             file_path=path,
             file_hash=file_hash,
-            row_count=len(df),
-            message=f"Đã đọc {len(df)} dòng có DG Case — lưu snapshot {snap}.",
             df=df,
+            file_name=file_name,
+            cache_note=f"Đã đọc {len(df)} dòng OL từ '{file_name}' — lưu snapshot {snap}",
+        )
+
+    def _finish_ol_load(
+        self,
+        *,
+        source: str,
+        snapshot_date: str,
+        file_path: str,
+        file_hash: str,
+        df: pd.DataFrame,
+        file_name: str,
+        cache_note: str,
+    ) -> OlLoadResult:
+        meta = self.db.get_ol_dataset(file_name, file_hash)
+        dataset_id = int(meta["id"]) if meta else None
+        if dataset_id:
+            self.db.set_active_ol_dataset(dataset_id)
+        return OlLoadResult(
+            source=source,
+            snapshot_date=snapshot_date,
+            file_path=file_path,
+            file_hash=file_hash,
+            row_count=len(df),
+            message=f"{cache_note} ({len(df)} dòng).",
+            df=df,
+            dataset_id=dataset_id,
+        )
+
+    def load_active_dataset(self) -> OlLoadResult | None:
+        """OL dataset vừa đọc gần nhất — dùng cho Planning / autofill."""
+        meta = self.db.get_active_ol_dataset_meta()
+        if not meta:
+            return None
+        df = self.db.load_active_ol_df()
+        if df is None:
+            return None
+        read_at = self.db.get_setup("ol_active_read_at", "")
+        file_name = normalize_text(meta.get("file_name"))
+        when = f", đọc lúc {read_at}" if read_at else ""
+        return OlLoadResult(
+            source="active_dataset",
+            snapshot_date=date.today().strftime("%Y-%m-%d"),
+            file_path=str(meta.get("file_path", "")),
+            file_hash=str(meta.get("file_hash", "")),
+            row_count=len(df),
+            message=f"OL đang dùng: '{file_name}' ({len(df)} dòng{when}).",
+            df=df,
+            dataset_id=int(meta["id"]),
         )
 
     def load_snapshot(self, snapshot_date: str) -> OlLoadResult | None:
@@ -211,6 +272,56 @@ class OlReaderService:
             lambda x: key == normalize_dg_case(x) or key in normalize_dg_case(x)
         )
         return df[mask].copy()
+
+    @staticmethod
+    def _qty_total(values) -> tuple[float, bool]:
+        total = 0.0
+        has_qty = False
+        for val in values:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            has_qty = True
+            try:
+                total += float(val)
+            except (TypeError, ValueError):
+                pass
+        return total, has_qty
+
+    @staticmethod
+    def _format_qty(total: float) -> str:
+        if total == int(total):
+            return str(int(total))
+        text = f"{total:.4f}".rstrip("0").rstrip(".")
+        return text or "0"
+
+    def summarize_for_planning(self, df: pd.DataFrame, dg_case: str) -> dict[str, str]:
+        """Lấy đúng cột đã lưu khi đọc OL: production_no, supplier, qty (cộng nếu tách dòng)."""
+        matches = self.find_by_dg_case(df, dg_case)
+        empty = {"production_no": "", "supplier": "", "quantity": ""}
+        if matches.empty:
+            return empty
+
+        supplier = ""
+        if "supplier" in matches.columns:
+            for val in matches["supplier"]:
+                text = normalize_text(val)
+                if text:
+                    supplier = text
+                    break
+
+        production_no = ""
+        if "production_no" in matches.columns:
+            codes = [normalize_text(v) for v in matches["production_no"] if normalize_text(v)]
+            if codes:
+                production_no = list(dict.fromkeys(codes))[0]
+
+        total_qty, has_qty = self._qty_total(matches["qty"]) if "qty" in matches.columns else (0.0, False)
+
+        return {
+            "production_no": production_no,
+            "supplier": supplier,
+            "quantity": self._format_qty(total_qty) if has_qty else "",
+        }
 
     def filter_by_order_date(self, df: pd.DataFrame, order_date: str) -> pd.DataFrame:
         if df.empty:

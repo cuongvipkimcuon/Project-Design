@@ -1,7 +1,7 @@
 """
 DG Hub — Đề xuất in tem (CustomTkinter).
 
-Đăng nhập → Setup | Orderlist Planning | Label Stocking | Label Supplier
+Đăng nhập → Setup | Planning | Plastic Label Management | Pictogram Management | Supplier Management
 """
 
 from __future__ import annotations
@@ -41,9 +41,9 @@ class DgHubApp(ctk.CTk):
         self._build_content()
 
     def _build_sidebar(self) -> None:
-        side = ctk.CTkFrame(self, width=240, corner_radius=0)
+        side = ctk.CTkFrame(self, width=280, corner_radius=0)
         side.grid(row=0, column=0, sticky="nsew")
-        side.grid_rowconfigure(8, weight=1)
+        side.grid_rowconfigure(10, weight=1)
 
         ctk.CTkLabel(side, text="DG Hub", font=FONT_TITLE).pack(padx=20, pady=(24, 2), anchor="w")
         ctk.CTkLabel(
@@ -62,9 +62,10 @@ class DgHubApp(ctk.CTk):
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
         for key, label in [
             ("setup", "Setup"),
-            ("planning", "Orderlist Planning"),
-            ("stocking", "Label Stocking"),
-            ("supplier", "Label Supplier"),
+            ("planning", "Planning"),
+            ("plastic_label", "Plastic Label Management"),
+            ("pictogram", "Pictogram Management"),
+            ("supplier", "Supplier Management"),
         ]:
             btn = ctk.CTkButton(
                 side,
@@ -97,15 +98,20 @@ class DgHubApp(ctk.CTk):
         self.pages: dict[str, ctk.CTkFrame] = {}
         self.pages["setup"] = SetupPanel(self.content, self.app_state)
         self.pages["planning"] = PlanningPanel(self.content, self.app_state)
-        self.pages["stocking"] = PlaceholderPanel(
+        self.pages["plastic_label"] = PlaceholderPanel(
             self.content,
-            title="Label Stocking",
-            description="Quản lý số lượng tem tồn kho — module sẽ được bổ sung sau.",
+            title="Plastic Label Management",
+            description="Quản lý tem nhựa — module sẽ được bổ sung sau.",
+        )
+        self.pages["pictogram"] = PlaceholderPanel(
+            self.content,
+            title="Pictogram Management",
+            description="Quản lý pictogram — module sẽ được bổ sung sau.",
         )
         self.pages["supplier"] = PlaceholderPanel(
             self.content,
-            title="Label Supplier",
-            description="Tạo và quản lý phiếu giao tem — module sẽ được bổ sung sau.",
+            title="Supplier Management",
+            description="Quản lý nhà cung cấp và phiếu giao tem — module sẽ được bổ sung sau.",
         )
 
         self._show_page("setup")
@@ -137,6 +143,8 @@ def run_app() -> None:
         return
 
     login.destroy()
+    session[0].load_active_ol_into_state()
+    session[0].load_bom_ke_into_state()
     app = DgHubApp(session[0])
     app.mainloop()
 
