@@ -1,7 +1,7 @@
 """
 DG Hub — Đề xuất in tem (CustomTkinter).
 
-Đăng nhập → Setup | Planning | Plastic Label Management | Pictogram Management | Supplier Management
+Đăng nhập → Setup | Sales | Design
 """
 
 from __future__ import annotations
@@ -16,20 +16,23 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.app_state import AppState
+from core.auth import AuthService
+from core.permissions import role_label
+from ui.design_panel import DesignPanel
 from ui.login_window import LoginWindow
-from ui.placeholder_panel import PlaceholderPanel
-from ui.planning_panel import PlanningPanel
+from ui.sales_panel import SalesPanel
 from ui.setup_panel import SetupPanel
 from ui.theme import APP_TITLE, APPEARANCE, COLOR_THEME, COLORS, FONT_SMALL, FONT_TITLE
 
 
 class DgHubApp(ctk.CTk):
-    def __init__(self, state: AppState):
+    def __init__(self, state: AppState, auth: AuthService):
         super().__init__()
         ctk.set_appearance_mode(APPEARANCE)
         ctk.set_default_color_theme(COLOR_THEME)
 
         self.app_state = state
+        self.auth = auth
         self.title(APP_TITLE)
         self.geometry("1320x800")
         self.minsize(1050, 660)
@@ -54,7 +57,7 @@ class DgHubApp(ctk.CTk):
         ).pack(padx=20, anchor="w")
         ctk.CTkLabel(
             side,
-            text=f"@{self.app_state.user.username}",
+            text=f"@{self.app_state.user.username} · {role_label(self.app_state.user.role)}",
             font=FONT_SMALL,
             text_color=COLORS["muted"],
         ).pack(padx=20, pady=(0, 20), anchor="w")
@@ -62,10 +65,8 @@ class DgHubApp(ctk.CTk):
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
         for key, label in [
             ("setup", "Setup"),
-            ("planning", "Planning"),
-            ("plastic_label", "Plastic Label Management"),
-            ("pictogram", "Pictogram Management"),
-            ("supplier", "Supplier Management"),
+            ("sales", "Sales"),
+            ("design", "Design"),
         ]:
             btn = ctk.CTkButton(
                 side,
@@ -96,25 +97,11 @@ class DgHubApp(ctk.CTk):
         self.content.grid_rowconfigure(0, weight=1)
 
         self.pages: dict[str, ctk.CTkFrame] = {}
-        self.pages["setup"] = SetupPanel(self.content, self.app_state)
-        self.pages["planning"] = PlanningPanel(self.content, self.app_state)
-        self.pages["plastic_label"] = PlaceholderPanel(
-            self.content,
-            title="Plastic Label Management",
-            description="Quản lý tem nhựa — module sẽ được bổ sung sau.",
-        )
-        self.pages["pictogram"] = PlaceholderPanel(
-            self.content,
-            title="Pictogram Management",
-            description="Quản lý pictogram — module sẽ được bổ sung sau.",
-        )
-        self.pages["supplier"] = PlaceholderPanel(
-            self.content,
-            title="Supplier Management",
-            description="Quản lý nhà cung cấp và phiếu giao tem — module sẽ được bổ sung sau.",
-        )
+        self.pages["setup"] = SetupPanel(self.content, self.app_state, self.auth)
+        self.pages["sales"] = SalesPanel(self.content)
+        self.pages["design"] = DesignPanel(self.content, self.app_state)
 
-        self._show_page("setup")
+        self._show_page("design")
 
     def _show_page(self, key: str) -> None:
         for page in self.pages.values():
@@ -129,10 +116,10 @@ class DgHubApp(ctk.CTk):
 
 
 def run_app() -> None:
-    session: list[AppState | None] = [None]
+    session: list[tuple[AppState, AuthService] | None] = [None]
 
-    def on_login_ok(state: AppState) -> None:
-        session[0] = state
+    def on_login_ok(state: AppState, auth: AuthService) -> None:
+        session[0] = (state, auth)
         login.quit()
 
     login = LoginWindow(on_success=on_login_ok)
@@ -143,9 +130,10 @@ def run_app() -> None:
         return
 
     login.destroy()
-    session[0].load_active_ol_into_state()
-    session[0].load_bom_ke_into_state()
-    app = DgHubApp(session[0])
+    state, auth = session[0]
+    state.load_active_ol_into_state()
+    state.load_bom_ke_into_state()
+    app = DgHubApp(state, auth)
     app.mainloop()
 
 

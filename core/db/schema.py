@@ -32,19 +32,21 @@ def build_schema(backend: DbBackend = DbBackend.SQLITE) -> list[str]:
         f"""
         CREATE TABLE IF NOT EXISTS ol_snapshots (
             id {pk},
+            owner_id TEXT NOT NULL DEFAULT '',
             snapshot_date TEXT NOT NULL,
             file_path TEXT NOT NULL,
             file_hash TEXT NOT NULL,
             imported_at TEXT NOT NULL,
-            row_count INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(snapshot_date)
+            row_count INTEGER NOT NULL DEFAULT 0
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS ol_file_hash (
-            file_path TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL DEFAULT '',
+            file_path TEXT NOT NULL,
             file_hash TEXT NOT NULL,
-            last_read_at TEXT NOT NULL
+            last_read_at TEXT NOT NULL,
+            PRIMARY KEY (owner_id, file_path)
         )
         """,
         f"""
@@ -53,6 +55,8 @@ def build_schema(backend: DbBackend = DbBackend.SQLITE) -> list[str]:
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             display_name TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT 'design',
+            approval_status TEXT NOT NULL DEFAULT 'approved',
             is_active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )
@@ -60,12 +64,12 @@ def build_schema(backend: DbBackend = DbBackend.SQLITE) -> list[str]:
         f"""
         CREATE TABLE IF NOT EXISTS ol_datasets (
             id {pk},
+            owner_id TEXT NOT NULL DEFAULT '',
             file_name TEXT NOT NULL,
             file_path TEXT NOT NULL,
             file_hash TEXT NOT NULL,
             imported_at TEXT NOT NULL,
-            row_count INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(file_name, file_hash)
+            row_count INTEGER NOT NULL DEFAULT 0
         )
         """,
         f"""
@@ -100,10 +104,11 @@ def build_schema(backend: DbBackend = DbBackend.SQLITE) -> list[str]:
         f"""
         CREATE TABLE IF NOT EXISTS bom_ke_datasets (
             id {pk},
+            owner_id TEXT NOT NULL DEFAULT '',
             file_name TEXT NOT NULL,
             file_path TEXT NOT NULL,
             a6_text TEXT NOT NULL,
-            a6_hash TEXT NOT NULL UNIQUE,
+            a6_hash TEXT NOT NULL,
             file_hash TEXT NOT NULL,
             imported_at TEXT NOT NULL,
             row_count INTEGER NOT NULL DEFAULT 0
@@ -117,13 +122,13 @@ def build_schema(backend: DbBackend = DbBackend.SQLITE) -> list[str]:
             dg_case TEXT NOT NULL DEFAULT '',
             order_date TEXT,
             product_code TEXT,
-            qty_divisor REAL,
+            order_qty REAL,
             ma_npl TEXT,
             ten_npl TEXT,
             mo_ta TEXT,
             don_vi_tinh TEXT,
-            so_luong_dm_1 REAL,
-            so_luong REAL,
+            npl_qty_per_unit REAL,
+            npl_qty_order REAL,
             customer_code TEXT,
             item_code TEXT,
             FOREIGN KEY(dataset_id) REFERENCES bom_ke_datasets(id) ON DELETE CASCADE
@@ -182,6 +187,51 @@ def build_schema(backend: DbBackend = DbBackend.SQLITE) -> list[str]:
         )
         """,
         f"""
+        CREATE TABLE IF NOT EXISTS supplier_slips (
+            id {pk},
+            slip_code TEXT NOT NULL DEFAULT '',
+            supplier TEXT NOT NULL DEFAULT '',
+            proposed_by TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT 'giao lần đầu',
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            checked_at TEXT NOT NULL DEFAULT '',
+            checked_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            owner_id TEXT NOT NULL DEFAULT ''
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS supplier_slip_lines (
+            id {pk},
+            slip_id INTEGER NOT NULL,
+            line_no INTEGER NOT NULL DEFAULT 0,
+            material_code TEXT NOT NULL DEFAULT '',
+            product_code TEXT NOT NULL DEFAULT '',
+            dg_case TEXT NOT NULL DEFAULT '',
+            color TEXT NOT NULL DEFAULT '',
+            logo TEXT NOT NULL DEFAULT '',
+            quantity REAL NOT NULL DEFAULT 0,
+            detail TEXT NOT NULL DEFAULT '',
+            plan_entry_id INTEGER,
+            prepare_item_id INTEGER,
+            is_custom INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(slip_id) REFERENCES supplier_slips(id) ON DELETE CASCADE
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS supplier_slip_audit (
+            id {pk},
+            slip_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            actor TEXT NOT NULL DEFAULT '',
+            actor_user_id INTEGER,
+            detail_json TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(slip_id) REFERENCES supplier_slips(id) ON DELETE CASCADE
+        )
+        """,
+        f"""
         CREATE TABLE IF NOT EXISTS weekly_label_plans (
             id {pk},
             week_start TEXT NOT NULL,
@@ -207,6 +257,9 @@ def build_indexes() -> list[str]:
         "CREATE INDEX IF NOT EXISTS idx_ol_rows_order_no ON ol_rows(order_no)",
         "CREATE INDEX IF NOT EXISTS idx_ol_rows_production_no ON ol_rows(production_no)",
         "CREATE INDEX IF NOT EXISTS idx_ol_rows_file_name ON ol_datasets(file_name)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ol_datasets_owner_scope ON ol_datasets(owner_id, file_name, file_hash)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bom_ke_datasets_owner_scope ON bom_ke_datasets(owner_id, a6_hash)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ol_snapshots_owner_scope ON ol_snapshots(owner_id, snapshot_date)",
         "CREATE INDEX IF NOT EXISTS idx_bom_ke_rows_dataset ON bom_ke_rows(dataset_id)",
         "CREATE INDEX IF NOT EXISTS idx_bom_ke_rows_dg_case ON bom_ke_rows(dg_case)",
         "CREATE INDEX IF NOT EXISTS idx_bom_ke_rows_product ON bom_ke_rows(product_code)",
@@ -224,6 +277,13 @@ def build_indexes() -> list[str]:
         "CREATE INDEX IF NOT EXISTS idx_planning_audit_entry ON planning_audit_log(entry_id)",
         "CREATE INDEX IF NOT EXISTS idx_planning_audit_created ON planning_audit_log(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_planning_audit_action ON planning_audit_log(action)",
+        "CREATE INDEX IF NOT EXISTS idx_supplier_slips_status ON supplier_slips(status)",
+        "CREATE INDEX IF NOT EXISTS idx_supplier_slips_supplier ON supplier_slips(supplier)",
+        "CREATE INDEX IF NOT EXISTS idx_supplier_slips_checked ON supplier_slips(checked_at)",
+        "CREATE INDEX IF NOT EXISTS idx_supplier_lines_slip ON supplier_slip_lines(slip_id)",
+        "CREATE INDEX IF NOT EXISTS idx_supplier_lines_dg ON supplier_slip_lines(dg_case)",
+        "CREATE INDEX IF NOT EXISTS idx_supplier_lines_product ON supplier_slip_lines(product_code)",
+        "CREATE INDEX IF NOT EXISTS idx_supplier_audit_slip ON supplier_slip_audit(slip_id)",
     ]
 
 

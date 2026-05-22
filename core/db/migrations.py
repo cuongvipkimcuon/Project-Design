@@ -46,6 +46,157 @@ def ensure_planning_prepare_items_table(cur: sqlite3.Cursor) -> None:
     )
 
 
+def ensure_user_role_column(cur: sqlite3.Cursor) -> None:
+    _add_column(cur, "users", "role", "role TEXT NOT NULL DEFAULT 'design'")
+
+
+def ensure_bom_ke_column_names(cur: sqlite3.Cursor) -> None:
+    """Doi ten cot bang ke: order_qty, npl_qty_per_unit, npl_qty_order."""
+    cols = _table_columns(cur, "bom_ke_rows")
+    renames = [
+        ("qty_divisor", "order_qty"),
+        ("so_luong_dm_1", "npl_qty_per_unit"),
+        ("so_luong", "npl_qty_order"),
+    ]
+    for old, new in renames:
+        if old in cols and new not in cols:
+            cur.execute(f"ALTER TABLE bom_ke_rows RENAME COLUMN {old} TO {new}")
+
+
+def ensure_user_approval_column(cur: sqlite3.Cursor) -> None:
+    _add_column(
+        cur,
+        "users",
+        "approval_status",
+        "approval_status TEXT NOT NULL DEFAULT 'approved'",
+    )
+
+
+def _has_index(cur: sqlite3.Cursor, name: str) -> bool:
+    row = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def ensure_owner_cache_tables(cur: sqlite3.Cursor) -> None:
+    """Cache OL/BOM/snapshot theo owner_id — mỗi user một không gian local."""
+    if "owner_id" not in _table_columns(cur, "ol_file_hash"):
+        cur.execute(
+            """
+            CREATE TABLE ol_file_hash_new (
+                owner_id TEXT NOT NULL DEFAULT '',
+                file_path TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                last_read_at TEXT NOT NULL,
+                PRIMARY KEY (owner_id, file_path)
+            )
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO ol_file_hash_new(owner_id, file_path, file_hash, last_read_at)
+            SELECT '', file_path, file_hash, last_read_at FROM ol_file_hash
+            """
+        )
+        cur.execute("DROP TABLE ol_file_hash")
+        cur.execute("ALTER TABLE ol_file_hash_new RENAME TO ol_file_hash")
+
+    if "owner_id" not in _table_columns(cur, "ol_datasets"):
+        cur.execute(
+            """
+            CREATE TABLE ol_datasets_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id TEXT NOT NULL DEFAULT '',
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                row_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO ol_datasets_new(id, owner_id, file_name, file_path, file_hash, imported_at, row_count)
+            SELECT id, '', file_name, file_path, file_hash, imported_at, row_count FROM ol_datasets
+            """
+        )
+        cur.execute("DROP TABLE ol_datasets")
+        cur.execute("ALTER TABLE ol_datasets_new RENAME TO ol_datasets")
+        cur.execute(
+            "CREATE UNIQUE INDEX idx_ol_datasets_owner_scope ON ol_datasets(owner_id, file_name, file_hash)"
+        )
+
+    if "owner_id" not in _table_columns(cur, "bom_ke_datasets"):
+        cur.execute(
+            """
+            CREATE TABLE bom_ke_datasets_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id TEXT NOT NULL DEFAULT '',
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                a6_text TEXT NOT NULL,
+                a6_hash TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                row_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO bom_ke_datasets_new(
+                id, owner_id, file_name, file_path, a6_text, a6_hash, file_hash, imported_at, row_count
+            )
+            SELECT id, '', file_name, file_path, a6_text, a6_hash, file_hash, imported_at, row_count
+            FROM bom_ke_datasets
+            """
+        )
+        cur.execute("DROP TABLE bom_ke_datasets")
+        cur.execute("ALTER TABLE bom_ke_datasets_new RENAME TO bom_ke_datasets")
+        cur.execute(
+            "CREATE UNIQUE INDEX idx_bom_ke_datasets_owner_scope ON bom_ke_datasets(owner_id, a6_hash)"
+        )
+
+    if "owner_id" not in _table_columns(cur, "ol_snapshots"):
+        cur.execute(
+            """
+            CREATE TABLE ol_snapshots_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id TEXT NOT NULL DEFAULT '',
+                snapshot_date TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                row_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO ol_snapshots_new(
+                id, owner_id, snapshot_date, file_path, file_hash, imported_at, row_count
+            )
+            SELECT id, '', snapshot_date, file_path, file_hash, imported_at, row_count FROM ol_snapshots
+            """
+        )
+        cur.execute("DROP TABLE ol_snapshots")
+        cur.execute("ALTER TABLE ol_snapshots_new RENAME TO ol_snapshots")
+        cur.execute(
+            "CREATE UNIQUE INDEX idx_ol_snapshots_owner_scope ON ol_snapshots(owner_id, snapshot_date)"
+        )
+
+
+def ensure_supplier_tables(cur: sqlite3.Cursor) -> None:
+    from core.db.schema import build_schema
+
+    for sql in build_schema():
+        if "supplier_slip" in sql:
+            cur.execute(sql)
+
+
 def ensure_planning_audit_table(cur: sqlite3.Cursor) -> None:
     cur.execute(
         """

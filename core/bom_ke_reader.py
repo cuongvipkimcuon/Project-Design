@@ -8,6 +8,21 @@ from pathlib import Path
 import openpyxl
 import pandas as pd
 
+from core.bom_ke_columns import (
+    COL_DG_CASE,
+    COL_DON_VI_TINH,
+    COL_MA_NPL,
+    COL_MO_TA,
+    COL_NPL_QTY_ORDER,
+    COL_NPL_QTY_PER_UNIT,
+    COL_ORDER_DATE,
+    COL_ORDER_QTY,
+    COL_PRODUCT_CODE,
+    COL_TEN_NPL,
+    NPL_QTY_ORDER,
+    NPL_QTY_PER_UNIT,
+    ORDER_QTY,
+)
 from core.database import HubDatabase
 from core.utils import (
     compute_file_signature,
@@ -71,16 +86,16 @@ class BomKeReaderService:
         out = pd.DataFrame(
             {
                 "row_index": data.index + 1,
-                "dg_case": data.iloc[:, 0].map(normalize_text),
-                "order_date": pd.to_datetime(data.iloc[:, 1], errors="coerce"),
-                "product_code": data.iloc[:, 3].map(normalize_text),
-                "qty_divisor": pd.to_numeric(data.iloc[:, 6], errors="coerce"),
-                "ma_npl": data.iloc[:, 9].map(normalize_text),
-                "ten_npl": data.iloc[:, 10].map(normalize_text),
-                "mo_ta": data.iloc[:, 11].map(normalize_text),
-                "don_vi_tinh": data.iloc[:, 13].map(normalize_text),
-                "so_luong_dm_1": pd.to_numeric(data.iloc[:, 14], errors="coerce"),
-                "so_luong": pd.to_numeric(data.iloc[:, 15], errors="coerce"),
+                "dg_case": data.iloc[:, COL_DG_CASE].map(normalize_text),
+                "order_date": pd.to_datetime(data.iloc[:, COL_ORDER_DATE], errors="coerce"),
+                "product_code": data.iloc[:, COL_PRODUCT_CODE].map(normalize_text),
+                ORDER_QTY: pd.to_numeric(data.iloc[:, COL_ORDER_QTY], errors="coerce"),
+                "ma_npl": data.iloc[:, COL_MA_NPL].map(normalize_text),
+                "ten_npl": data.iloc[:, COL_TEN_NPL].map(normalize_text),
+                "mo_ta": data.iloc[:, COL_MO_TA].map(normalize_text),
+                "don_vi_tinh": data.iloc[:, COL_DON_VI_TINH].map(normalize_text),
+                NPL_QTY_PER_UNIT: pd.to_numeric(data.iloc[:, COL_NPL_QTY_PER_UNIT], errors="coerce"),
+                NPL_QTY_ORDER: pd.to_numeric(data.iloc[:, COL_NPL_QTY_ORDER], errors="coerce"),
             }
         )
         out["customer_code"] = out["product_code"].map(extract_customer_code_from_product_code)
@@ -119,9 +134,7 @@ class BomKeReaderService:
 
         a6_text, a6_hash, df = self.parse_bom_ke_excel(path)
         self.db.save_bom_ke_dataset(path, file_hash, a6_text, a6_hash, df)
-        self.db.set_setup("bom_ke_file_path", path)
-        self.db.set_setup("bom_ke_a6_hash", a6_hash)
-        self.db.set_setup("bom_ke_a6_text", a6_text)
+        self._persist_bom_ke_pointers(path, file_name, file_hash, a6_text, a6_hash, len(df))
 
         return BomKeLoadResult(
             source="parsed",
@@ -134,6 +147,30 @@ class BomKeReaderService:
             message=f"Đã đọc {len(df)} dòng bảng kê — cache theo A6 ({a6_hash[:8]}…).",
             df=df,
         )
+
+    def _persist_bom_ke_pointers(
+        self,
+        path: str,
+        file_name: str,
+        file_hash: str,
+        a6_text: str,
+        a6_hash: str,
+        row_count: int,
+    ) -> None:
+        self.db.set_setup("bom_ke_file_path", path)
+        self.db.set_setup("bom_ke_a6_hash", a6_hash)
+        self.db.set_setup("bom_ke_a6_text", a6_text)
+        if self.db.cloud is not None:
+            self.db.cloud.set_active_dataset("bom_ke", a6_hash)
+            self.db.cloud.upsert_dataset(
+                dataset_type="bom_ke",
+                file_name=file_name,
+                file_path=path,
+                file_hash=file_hash,
+                content_hash=a6_hash,
+                row_count=row_count,
+                is_active=True,
+            )
 
     def load_cached(self, a6_hash: str | None = None) -> BomKeLoadResult | None:
         key = a6_hash or self.db.get_setup("bom_ke_a6_hash", "")

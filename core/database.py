@@ -7,16 +7,26 @@ import pickle
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
+from core.bom_ke_columns import NPL_QTY_ORDER, NPL_QTY_PER_UNIT, ORDER_QTY
 from core.db.dialect import now_iso
 from core.db.migrations import (
+    ensure_owner_cache_tables,
     ensure_planning_audit_table,
     ensure_planning_columns,
     ensure_planning_prepare_items_table,
+    ensure_bom_ke_column_names,
+    ensure_supplier_tables,
+    ensure_user_approval_column,
+    ensure_user_role_column,
 )
+
+if TYPE_CHECKING:
+    from core.user_cloud import UserCloud
+from core.permissions import DEFAULT_ROLE, normalize_role
 from core.db.schema import PLANNING_ACTIVE_FILTER, build_indexes, build_schema
 from core.utils import hash_password, normalize_text
 
@@ -24,9 +34,25 @@ DB_FILE = "dg_hub.db"
 
 
 class HubDatabase:
-    def __init__(self, db_file: str = DB_FILE):
+    def __init__(
+        self,
+        db_file: str = DB_FILE,
+        *,
+        owner_id: str = "",
+        cloud: UserCloud | None = None,
+    ):
         self.db_file = db_file
+        self.owner_id = normalize_text(owner_id)
+        self.cloud = cloud
         self._init_db()
+
+    def _oid(self) -> str:
+        return self.owner_id
+
+    def _sk(self, key: str) -> str:
+        if self.owner_id:
+            return f"u:{self.owner_id}:{key}"
+        return key
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_file)
@@ -41,6 +67,11 @@ class HubDatabase:
         ensure_planning_columns(cur)
         ensure_planning_audit_table(cur)
         ensure_planning_prepare_items_table(cur)
+        ensure_user_role_column(cur)
+        ensure_user_approval_column(cur)
+        ensure_owner_cache_tables(cur)
+        ensure_bom_ke_column_names(cur)
+        ensure_supplier_tables(cur)
         for sql in build_indexes():
             cur.execute(sql)
         conn.commit()
@@ -54,16 +85,35 @@ class HubDatabase:
         conn.close()
         return int(n)
 
-    def create_user(self, username: str, password: str, display_name: str = "") -> int:
+    def create_user(
+        self,
+        username: str,
+        password: str,
+        display_name: str = "",
+        *,
+        role: str = DEFAULT_ROLE,
+        approval_status: str = "pending",
+        is_active: bool = False,
+    ) -> int:
         now = datetime.now().isoformat(timespec="seconds")
         conn = self._connect()
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO users(username, password_hash, display_name, is_active, created_at)
-            VALUES (?, ?, ?, 1, ?)
+            INSERT INTO users(
+                username, password_hash, display_name, role, approval_status, is_active, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (username.strip(), hash_password(password), display_name.strip() or username.strip(), now),
+            (
+                username.strip().lower(),
+                hash_password(password),
+                display_name.strip() or username.strip(),
+                normalize_role(role),
+                approval_status,
+                1 if is_active else 0,
+                now,
+            ),
         )
         uid = int(cur.lastrowid)
         conn.commit()
@@ -92,6 +142,64 @@ class HubDatabase:
         conn.execute("UPDATE users SET display_name = ? WHERE id = ?", (display_name, user_id))
         conn.commit()
         conn.close()
+
+    def update_user_password(self, user_id: int, new_password: str) -> None:
+        conn = self._connect()
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(new_password), user_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def update_user_role(self, user_id: int, role: str) -> None:
+        conn = self._connect()
+        conn.execute(
+            "UPDATE users SET role = ? WHERE id = ?",
+            (normalize_role(role), user_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def set_user_active(self, user_id: int, is_active: bool) -> None:
+        conn = self._connect()
+        conn.execute(
+            "UPDATE users SET is_active = ? WHERE id = ?",
+            (1 if is_active else 0, user_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def update_user_approval(
+        self,
+        user_id: int,
+        approval_status: str,
+        *,
+        is_active: bool | None = None,
+        role: str | None = None,
+    ) -> None:
+        conn = self._connect()
+        if is_active is None:
+            is_active = approval_status == "approved"
+        sql = "UPDATE users SET approval_status = ?, is_active = ?"
+        params: list[Any] = [approval_status, 1 if is_active else 0]
+        if role is not None:
+            sql += ", role = ?"
+            params.append(normalize_role(role))
+        sql += " WHERE id = ?"
+        params.append(user_id)
+        conn.execute(sql, params)
+        conn.commit()
+        conn.close()
+
+    def list_users(self) -> list[dict[str, Any]]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM users ORDER BY username COLLATE NOCASE ASC"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
 
     # --- Weekly label plans ---
 
@@ -596,27 +704,32 @@ class HubDatabase:
 
     def get_setup(self, key: str, default: str = "") -> str:
         conn = self._connect()
-        row = conn.execute("SELECT value FROM setup WHERE key = ?", (key,)).fetchone()
+        row = conn.execute(
+            "SELECT value FROM setup WHERE key = ?",
+            (self._sk(key),),
+        ).fetchone()
         conn.close()
         return str(row[0]) if row and row[0] is not None else default
 
-    def set_setup(self, key: str, value: str) -> None:
+    def set_setup(self, key: str, value: str, *, sync_cloud: bool = True) -> None:
         conn = self._connect()
         conn.execute(
             """
             INSERT INTO setup(key, value) VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
-            (key, value),
+            (self._sk(key), value),
         )
         conn.commit()
         conn.close()
+        if sync_cloud and self.cloud is not None:
+            self.cloud.set_setting(key, value)
 
     def get_file_hash(self, file_path: str) -> str | None:
         conn = self._connect()
         row = conn.execute(
-            "SELECT file_hash FROM ol_file_hash WHERE file_path = ?",
-            (file_path,),
+            "SELECT file_hash FROM ol_file_hash WHERE owner_id = ? AND file_path = ?",
+            (self._oid(), file_path),
         ).fetchone()
         conn.close()
         return str(row[0]) if row else None
@@ -626,13 +739,13 @@ class HubDatabase:
         conn = self._connect()
         conn.execute(
             """
-            INSERT INTO ol_file_hash(file_path, file_hash, last_read_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(file_path) DO UPDATE SET
+            INSERT INTO ol_file_hash(owner_id, file_path, file_hash, last_read_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(owner_id, file_path) DO UPDATE SET
                 file_hash = excluded.file_hash,
                 last_read_at = excluded.last_read_at
             """,
-            (file_path, file_hash, now),
+            (self._oid(), file_path, file_hash, now),
         )
         conn.commit()
         conn.close()
@@ -644,9 +757,9 @@ class HubDatabase:
             """
             SELECT id, file_name, file_path, file_hash, imported_at, row_count
             FROM ol_datasets
-            WHERE file_name = ? AND file_hash = ?
+            WHERE owner_id = ? AND file_name = ? AND file_hash = ?
             """,
-            (file_name, file_hash),
+            (self._oid(), file_name, file_hash),
         ).fetchone()
         conn.close()
         return dict(row) if row else None
@@ -657,9 +770,9 @@ class HubDatabase:
         row = conn.execute(
             """
             SELECT id, file_name, file_path, file_hash, imported_at, row_count
-            FROM ol_datasets WHERE id = ?
+            FROM ol_datasets WHERE id = ? AND owner_id = ?
             """,
-            (dataset_id,),
+            (dataset_id, self._oid()),
         ).fetchone()
         conn.close()
         return dict(row) if row else None
@@ -673,6 +786,17 @@ class HubDatabase:
         self.set_setup("ol_active_read_at", ts)
         self.set_setup("ol_active_file_name", normalize_text(meta.get("file_name")))
         self.set_setup("ol_active_file_path", normalize_text(meta.get("file_path")))
+        if self.cloud is not None:
+            self.cloud.set_active_dataset("ol", str(meta.get("file_hash", "")))
+            self.cloud.upsert_dataset(
+                dataset_type="ol",
+                file_name=str(meta.get("file_name", "")),
+                file_path=str(meta.get("file_path", "")),
+                file_hash=str(meta.get("file_hash", "")),
+                content_hash=str(meta.get("file_hash", "")),
+                row_count=int(meta.get("row_count", 0) or 0),
+                is_active=True,
+            )
 
     def get_active_ol_dataset_meta(self) -> dict[str, Any] | None:
         raw = self.get_setup("ol_active_dataset_id", "")
@@ -694,18 +818,18 @@ class HubDatabase:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO ol_datasets(file_name, file_path, file_hash, imported_at, row_count)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(file_name, file_hash) DO UPDATE SET
+            INSERT INTO ol_datasets(owner_id, file_name, file_path, file_hash, imported_at, row_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_id, file_name, file_hash) DO UPDATE SET
                 file_path = excluded.file_path,
                 imported_at = excluded.imported_at,
                 row_count = excluded.row_count
             """,
-            (file_name, path, file_hash, now, len(df)),
+            (self._oid(), file_name, path, file_hash, now, len(df)),
         )
         row = cur.execute(
-            "SELECT id FROM ol_datasets WHERE file_name = ? AND file_hash = ?",
-            (file_name, file_hash),
+            "SELECT id FROM ol_datasets WHERE owner_id = ? AND file_name = ? AND file_hash = ?",
+            (self._oid(), file_name, file_hash),
         ).fetchone()
         dataset_id = int(row[0])
         cur.execute("DELETE FROM ol_rows WHERE dataset_id = ?", (dataset_id,))
@@ -752,6 +876,16 @@ class HubDatabase:
             )
         conn.commit()
         conn.close()
+        if self.cloud is not None:
+            self.cloud.upsert_dataset(
+                dataset_type="ol",
+                file_name=file_name,
+                file_path=path,
+                file_hash=file_hash,
+                content_hash=file_hash,
+                row_count=len(df),
+                is_active=False,
+            )
         return dataset_id
 
     def load_ol_dataset_df(self, file_name: str, file_hash: str) -> pd.DataFrame | None:
@@ -795,9 +929,9 @@ class HubDatabase:
         row = conn.execute(
             """
             SELECT id, file_name, file_path, a6_text, a6_hash, file_hash, imported_at, row_count
-            FROM bom_ke_datasets WHERE a6_hash = ?
+            FROM bom_ke_datasets WHERE owner_id = ? AND a6_hash = ?
             """,
-            (a6_hash,),
+            (self._oid(), a6_hash),
         ).fetchone()
         conn.close()
         return dict(row) if row else None
@@ -818,9 +952,9 @@ class HubDatabase:
         cur.execute(
             """
             INSERT INTO bom_ke_datasets(
-                file_name, file_path, a6_text, a6_hash, file_hash, imported_at, row_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(a6_hash) DO UPDATE SET
+                owner_id, file_name, file_path, a6_text, a6_hash, file_hash, imported_at, row_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(owner_id, a6_hash) DO UPDATE SET
                 file_name = excluded.file_name,
                 file_path = excluded.file_path,
                 file_hash = excluded.file_hash,
@@ -828,11 +962,11 @@ class HubDatabase:
                 imported_at = excluded.imported_at,
                 row_count = excluded.row_count
             """,
-            (file_name, path, a6_text, a6_hash, file_hash, now, len(df)),
+            (self._oid(), file_name, path, a6_text, a6_hash, file_hash, now, len(df)),
         )
         row = cur.execute(
-            "SELECT id FROM bom_ke_datasets WHERE a6_hash = ?",
-            (a6_hash,),
+            "SELECT id FROM bom_ke_datasets WHERE owner_id = ? AND a6_hash = ?",
+            (self._oid(), a6_hash),
         ).fetchone()
         dataset_id = int(row[0])
         cur.execute("DELETE FROM bom_ke_rows WHERE dataset_id = ?", (dataset_id,))
@@ -846,13 +980,13 @@ class HubDatabase:
                         normalize_text(r.get("dg_case")),
                         self._serialize_dt(r.get("order_date")),
                         normalize_text(r.get("product_code")),
-                        self._safe_float(r.get("qty_divisor")),
+                        self._safe_float(r.get(ORDER_QTY)),
                         normalize_text(r.get("ma_npl")),
                         normalize_text(r.get("ten_npl")),
                         normalize_text(r.get("mo_ta")),
                         normalize_text(r.get("don_vi_tinh")),
-                        self._safe_float(r.get("so_luong_dm_1")),
-                        self._safe_float(r.get("so_luong")),
+                        self._safe_float(r.get(NPL_QTY_PER_UNIT)),
+                        self._safe_float(r.get(NPL_QTY_ORDER)),
                         normalize_text(r.get("customer_code")),
                         normalize_text(r.get("item_code")),
                     )
@@ -860,8 +994,8 @@ class HubDatabase:
             cur.executemany(
                 """
                 INSERT INTO bom_ke_rows(
-                    dataset_id, row_index, dg_case, order_date, product_code, qty_divisor,
-                    ma_npl, ten_npl, mo_ta, don_vi_tinh, so_luong_dm_1, so_luong,
+                    dataset_id, row_index, dg_case, order_date, product_code, order_qty,
+                    ma_npl, ten_npl, mo_ta, don_vi_tinh, npl_qty_per_unit, npl_qty_order,
                     customer_code, item_code
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -869,6 +1003,16 @@ class HubDatabase:
             )
         conn.commit()
         conn.close()
+        if self.cloud is not None:
+            self.cloud.upsert_dataset(
+                dataset_type="bom_ke",
+                file_name=file_name,
+                file_path=path,
+                file_hash=file_hash,
+                content_hash=a6_hash,
+                row_count=len(df),
+                is_active=False,
+            )
         return dataset_id
 
     def load_bom_ke_dataset_df(self, a6_hash: str) -> pd.DataFrame | None:
@@ -1015,6 +1159,14 @@ class HubDatabase:
         conn.close()
         return self._bom_ke_rows_to_dataframe(df)
 
+    @staticmethod
+    def _bom_col(df: pd.DataFrame, new_name: str, legacy: str) -> pd.Series:
+        if new_name in df.columns:
+            return df[new_name]
+        if legacy in df.columns:
+            return df[legacy]
+        return pd.Series([None] * len(df), index=df.index)
+
     def _bom_ke_rows_to_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame(
@@ -1023,13 +1175,13 @@ class HubDatabase:
                     "dg_case",
                     "order_date",
                     "product_code",
-                    "qty_divisor",
+                    ORDER_QTY,
                     "ma_npl",
                     "ten_npl",
                     "mo_ta",
                     "don_vi_tinh",
-                    "so_luong_dm_1",
-                    "so_luong",
+                    NPL_QTY_PER_UNIT,
+                    NPL_QTY_ORDER,
                     "customer_code",
                     "item_code",
                 ]
@@ -1040,13 +1192,17 @@ class HubDatabase:
                 "dg_case": df["dg_case"].fillna("").astype(str),
                 "order_date": pd.to_datetime(df["order_date"], errors="coerce"),
                 "product_code": df["product_code"].fillna("").astype(str),
-                "qty_divisor": pd.to_numeric(df["qty_divisor"], errors="coerce"),
+                ORDER_QTY: pd.to_numeric(self._bom_col(df, ORDER_QTY, "qty_divisor"), errors="coerce"),
                 "ma_npl": df["ma_npl"].fillna("").astype(str),
                 "ten_npl": df["ten_npl"].fillna("").astype(str),
                 "mo_ta": df["mo_ta"].fillna("").astype(str),
                 "don_vi_tinh": df["don_vi_tinh"].fillna("").astype(str),
-                "so_luong_dm_1": pd.to_numeric(df["so_luong_dm_1"], errors="coerce"),
-                "so_luong": pd.to_numeric(df["so_luong"], errors="coerce"),
+                NPL_QTY_PER_UNIT: pd.to_numeric(
+                    self._bom_col(df, NPL_QTY_PER_UNIT, "so_luong_dm_1"), errors="coerce"
+                ),
+                NPL_QTY_ORDER: pd.to_numeric(
+                    self._bom_col(df, NPL_QTY_ORDER, "so_luong"), errors="coerce"
+                ),
                 "customer_code": df["customer_code"].fillna("").astype(str),
                 "item_code": df["item_code"].fillna("").astype(str),
             }
@@ -1056,7 +1212,8 @@ class HubDatabase:
     def list_snapshot_dates(self) -> list[str]:
         conn = self._connect()
         rows = conn.execute(
-            "SELECT snapshot_date FROM ol_snapshots ORDER BY snapshot_date DESC"
+            "SELECT snapshot_date FROM ol_snapshots WHERE owner_id = ? ORDER BY snapshot_date DESC",
+            (self._oid(),),
         ).fetchall()
         conn.close()
         return [str(r[0]) for r in rows]
@@ -1066,9 +1223,9 @@ class HubDatabase:
         row = conn.execute(
             """
             SELECT id, snapshot_date, file_path, file_hash, imported_at, row_count
-            FROM ol_snapshots WHERE snapshot_date = ?
+            FROM ol_snapshots WHERE owner_id = ? AND snapshot_date = ?
             """,
-            (snapshot_date,),
+            (self._oid(), snapshot_date),
         ).fetchone()
         conn.close()
         return row
@@ -1076,7 +1233,9 @@ class HubDatabase:
     def get_snapshot_data_path(self, snapshot_id: int) -> Path:
         cache_dir = Path(self.db_file).parent / "ol_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir / f"snapshot_{snapshot_id}.pkl"
+        owner = self._oid() or "global"
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in owner)[:48]
+        return cache_dir / f"snapshot_{safe}_{snapshot_id}.pkl"
 
     def load_snapshot_df(self, snapshot_date: str) -> pd.DataFrame | None:
         meta = self.get_snapshot_meta(snapshot_date)
@@ -1110,8 +1269,8 @@ class HubDatabase:
         conn = self._connect()
         cur = conn.cursor()
         cur.execute(
-            "SELECT id FROM ol_snapshots WHERE snapshot_date = ?",
-            (snapshot_date,),
+            "SELECT id FROM ol_snapshots WHERE owner_id = ? AND snapshot_date = ?",
+            (self._oid(), snapshot_date),
         )
         existing = cur.fetchone()
         if existing:
@@ -1120,17 +1279,19 @@ class HubDatabase:
                 """
                 UPDATE ol_snapshots
                 SET file_path = ?, file_hash = ?, imported_at = ?, row_count = ?
-                WHERE id = ?
+                WHERE id = ? AND owner_id = ?
                 """,
-                (file_path, file_hash, now, len(df), snap_id),
+                (file_path, file_hash, now, len(df), snap_id, self._oid()),
             )
         else:
             cur.execute(
                 """
-                INSERT INTO ol_snapshots(snapshot_date, file_path, file_hash, imported_at, row_count)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO ol_snapshots(
+                    owner_id, snapshot_date, file_path, file_hash, imported_at, row_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (snapshot_date, file_path, file_hash, now, len(df)),
+                (self._oid(), snapshot_date, file_path, file_hash, now, len(df)),
             )
             snap_id = int(cur.lastrowid)
         conn.commit()
@@ -1157,8 +1318,8 @@ class HubDatabase:
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         conn = self._connect()
         rows = conn.execute(
-            "SELECT id, snapshot_date FROM ol_snapshots WHERE snapshot_date < ?",
-            (cutoff,),
+            "SELECT id, snapshot_date FROM ol_snapshots WHERE owner_id = ? AND snapshot_date < ?",
+            (self._oid(), cutoff),
         ).fetchall()
         for snap_id, snap_date in rows:
             path = self.get_snapshot_data_path(int(snap_id))

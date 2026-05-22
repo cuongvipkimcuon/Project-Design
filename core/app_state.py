@@ -10,13 +10,24 @@ import pandas as pd
 from core.bom_ke_reader import BomKeLoadResult, BomKeReaderService
 from core.database import HubDatabase
 from core.ol_reader import OlLoadResult, OlReaderService
+from core.permissions import can_write, normalize_role
 
 
 @dataclass
 class SessionUser:
-    id: int
+    id: str
     username: str
     display_name: str
+    role: str = "design"
+
+    def can_write(self, module: str) -> bool:
+        return can_write(self.role, module)
+
+    def numeric_id(self) -> int | None:
+        """ID số cho SQLite created_by (Supabase UUID → None)."""
+        if str(self.id).isdigit():
+            return int(self.id)
+        return None
 
 
 @dataclass

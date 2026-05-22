@@ -6,6 +6,7 @@ import unicodedata
 
 import pandas as pd
 
+from core.bom_ke_columns import NPL_QTY_ORDER
 from core.utils import normalize_dg_case, normalize_text
 
 LABEL_NPL_KEYWORDS = ("nhan", "label", "poly", "satin", "picto")
@@ -24,7 +25,8 @@ def is_label_npl_row(ten_npl: object) -> bool:
 
 
 def _row_quantity(row: pd.Series) -> float:
-    for key in ("so_luong", "quantity"):
+    """So luong NPL cho ca don hang (cot P bang ke)."""
+    for key in (NPL_QTY_ORDER, "quantity"):
         if key not in row.index:
             continue
         val = row[key]

@@ -9,6 +9,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from core.app_state import AppState
+from core.permissions import MOD_DESIGN_PLANNING
 from core.planning_service import (
     DEFAULT_EXCEL_MAP,
     PlanningValidationError,
@@ -30,6 +31,7 @@ from core.planning_service import (
     validate_plan_payload,
 )
 from core.utils import format_date_dd_mm_yyyy, normalize_text, parse_date_dd_mm_yyyy
+from ui.dialog_utils import configure_dialog, create_dialog_layout, show_dialog
 from ui.theme import COLORS, FONT_BODY, FONT_SMALL
 
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -66,8 +68,7 @@ class DatePickerDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.on_select = on_select
         self.title(title)
-        self.geometry("340x340")
-        self.resizable(False, False)
+        configure_dialog(self, width=360, height=380, min_width=360, min_height=380, resizable=False, parent=master)
         self.transient(master.winfo_toplevel())
         self.grab_set()
 
@@ -173,24 +174,31 @@ class AddPlanDialog(ctk.CTkToplevel):
         self.on_import_batch = on_import_batch
         self.lookup_from_ol = lookup_from_ol
         self.title("Add Plan")
-        self.geometry("620x620")
-        self.resizable(False, False)
+        configure_dialog(self, width=640, height=680, min_width=600, min_height=620, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
         self.grab_set()
 
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=20, pady=16)
+        body.grid_rowconfigure(1, weight=1)
+        body.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(body, text="Add Production Plan", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        head = ctk.CTkFrame(body, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(head, text="Add Production Plan", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ctk.CTkLabel(
-            body,
+            head,
             text="Enter manually or import rows from Excel with configurable columns.",
             font=FONT_SMALL,
             text_color=COLORS["muted"],
         ).pack(anchor="w", pady=(4, 12))
 
-        tabs = ctk.CTkTabview(body, height=460)
-        tabs.pack(fill="both", expand=True)
+        tabs_wrap = ctk.CTkFrame(body, fg_color="transparent")
+        tabs_wrap.grid(row=1, column=0, sticky="nsew")
+        tabs_wrap.grid_rowconfigure(0, weight=1)
+        tabs_wrap.grid_columnconfigure(0, weight=1)
+        tabs = ctk.CTkTabview(tabs_wrap)
+        tabs.grid(row=0, column=0, sticky="nsew")
         tabs.add("Manual Entry")
         tabs.add("Import Excel")
 
@@ -437,38 +445,36 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
 
         already = effective_prepare_status(plan) == "prepared"
         self.title("Update Prepare" if already else "Prepare Labels")
-        self.geometry("820x520")
-        self.minsize(760, 420)
+        configure_dialog(self, width=920, height=640, min_width=840, min_height=560, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
         self.grab_set()
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=20, pady=16)
+        _, header, content, footer = create_dialog_layout(self)
 
         dg = normalize_text(plan.get("dg_case"))
         prod = normalize_text(plan.get("item_code"))
         supplier = normalize_text(plan.get("supplier"))
-        ctk.CTkLabel(body, text="Prepare — Select Labels", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ctk.CTkLabel(header, text="Prepare — Select Labels", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ctk.CTkLabel(
-            body,
+            header,
             text=f"DG Case {dg} · {prod} · {supplier}",
             font=FONT_SMALL,
             text_color=COLORS["muted"],
         ).pack(anchor="w", pady=(4, 4))
         ctk.CTkLabel(
-            body,
+            header,
             text=(
                 "Label rows from bảng kê (Số S/O) where Tên NPL contains: "
                 "nhãn, label, poly, satin, picto…"
             ),
             font=FONT_SMALL,
             text_color=COLORS["muted"],
-            wraplength=760,
+            wraplength=860,
             justify="left",
-        ).pack(anchor="w", pady=(0, 10))
+        ).pack(anchor="w", pady=(0, 8))
 
-        toolbar = ctk.CTkFrame(body, fg_color="transparent")
-        toolbar.pack(fill="x", pady=(0, 8))
+        toolbar = ctk.CTkFrame(header, fg_color="transparent")
+        toolbar.pack(fill="x", pady=(0, 4))
         ctk.CTkButton(toolbar, text="Select all", width=90, height=30, command=self._select_all).pack(
             side="left", padx=(0, 6)
         )
@@ -478,39 +484,45 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
         self.summary_label = ctk.CTkLabel(toolbar, text="", font=FONT_SMALL, text_color=COLORS["muted"])
         self.summary_label.pack(side="right")
 
-        table_wrap = ctk.CTkFrame(body, fg_color=COLORS["card"], corner_radius=10)
-        table_wrap.pack(fill="both", expand=True)
+        table_wrap = ctk.CTkFrame(content, fg_color=COLORS["card"], corner_radius=10)
+        table_wrap.grid(row=0, column=0, sticky="nsew")
+        table_wrap.grid_rowconfigure(1, weight=1)
+        table_wrap.grid_columnconfigure(0, weight=1)
 
-        header = ctk.CTkFrame(table_wrap, fg_color=("gray88", "gray28"), corner_radius=0)
-        header.pack(fill="x", padx=12, pady=(12, 0))
+        col_header = ctk.CTkFrame(table_wrap, fg_color=("gray88", "gray28"), corner_radius=0)
+        col_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 0))
         for title, width in self.TABLE_HEADERS:
             ctk.CTkLabel(
-                header,
+                col_header,
                 text=title,
                 width=width,
                 anchor="center",
                 font=("Segoe UI", 11, "bold"),
             ).pack(side="left", padx=4, pady=8)
 
-        self.rows_frame = ctk.CTkScrollableFrame(table_wrap, fg_color="transparent", height=280)
-        self.rows_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.rows_frame = ctk.CTkScrollableFrame(table_wrap, fg_color="transparent")
+        self.rows_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
-        actions = ctk.CTkFrame(body, fg_color="transparent")
-        actions.pack(fill="x", pady=(12, 0))
-        ctk.CTkButton(actions, text="Cancel", width=90, fg_color="transparent", command=self.destroy).pack(
-            side="right", padx=(8, 0)
-        )
         confirm_text = "Confirm Update" if already else "Confirm Prepare"
         ctk.CTkButton(
-            actions,
+            footer,
             text=confirm_text,
-            width=140,
+            width=150,
+            height=36,
             fg_color=COLORS["success"][1],
             command=self._confirm,
         ).pack(side="right")
+        ctk.CTkButton(
+            footer,
+            text="Cancel",
+            width=90,
+            height=36,
+            fg_color="transparent",
+            command=self.destroy,
+        ).pack(side="right", padx=(0, 8))
 
         self._load_rows()
-        self.after(80, lambda: (self.lift(), self.focus_force()))
+        show_dialog(self, master)
 
     def _load_rows(self) -> None:
         from core.prepare_service import item_key, list_label_candidates
@@ -603,7 +615,7 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
             self.entry_id,
             selected,
             prepare_by=actor,
-            actor_user_id=self.state.user.id,
+            actor_user_id=self.state.user.numeric_id(),
         )
         messagebox.showinfo(
             "Prepare",
@@ -639,6 +651,7 @@ class DayDetailDialog(ctk.CTkToplevel):
         on_remove,
         on_refresh,
         on_add_plan=None,
+        can_write: bool = True,
     ):
         super().__init__(master)
         self.db = db
@@ -648,26 +661,26 @@ class DayDetailDialog(ctk.CTkToplevel):
         self.on_remove = on_remove
         self.on_refresh = on_refresh
         self.on_add_plan = on_add_plan
+        self._can_write = can_write
         self.selected_id: int | None = None
         self.title("Day Plan Details")
-        self.geometry("1180x540")
-        self.minsize(1100, 460)
+        configure_dialog(self, width=1180, height=600, min_width=1000, min_height=500, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
         self.protocol("WM_DELETE_WINDOW", self._close)
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=24, pady=20)
+        _, header, content, footer = create_dialog_layout(self, padx=24, pady=20)
 
         ctk.CTkLabel(
-            body,
+            header,
             text=day.strftime("%A, %d-%m-%Y"),
             font=("Segoe UI", 18, "bold"),
         ).pack(anchor="center")
-        self.subtitle = ctk.CTkLabel(body, text="", font=FONT_SMALL, text_color=COLORS["muted"])
+        self.subtitle = ctk.CTkLabel(header, text="", font=FONT_SMALL, text_color=COLORS["muted"])
         self.subtitle.pack(anchor="center", pady=(4, 12))
 
-        action_bar = ctk.CTkFrame(body, fg_color="transparent")
-        action_bar.pack(anchor="center", pady=(0, 10))
+        action_bar = ctk.CTkFrame(header, fg_color="transparent")
+        action_bar.pack(anchor="center", pady=(0, 8))
+        btn_state = "normal" if self._can_write else "disabled"
         ctk.CTkButton(
             action_bar,
             text="Confirm Delivery",
@@ -675,6 +688,7 @@ class DayDetailDialog(ctk.CTkToplevel):
             height=34,
             fg_color=COLORS["success"][1],
             command=self._confirm_selected,
+            state=btn_state,
         ).pack(side="left", padx=6)
         ctk.CTkButton(
             action_bar,
@@ -682,6 +696,7 @@ class DayDetailDialog(ctk.CTkToplevel):
             width=100,
             height=34,
             command=self._prepare_selected,
+            state=btn_state,
         ).pack(side="left", padx=6)
         ctk.CTkButton(
             action_bar,
@@ -691,6 +706,7 @@ class DayDetailDialog(ctk.CTkToplevel):
             fg_color="#c62828",
             hover_color="#b71c1c",
             command=self._remove_selected,
+            state=btn_state,
         ).pack(side="left", padx=6)
         ctk.CTkLabel(
             action_bar,
@@ -699,31 +715,31 @@ class DayDetailDialog(ctk.CTkToplevel):
             text_color=COLORS["muted"],
         ).pack(side="left", padx=(12, 0))
 
-        table_outer = ctk.CTkFrame(body, fg_color="transparent")
-        table_outer.pack(fill="both", expand=True)
-        table_wrap = ctk.CTkFrame(table_outer, fg_color=COLORS["card"], corner_radius=10)
-        table_wrap.pack(anchor="center", fill="both", expand=True)
+        table_wrap = ctk.CTkFrame(content, fg_color=COLORS["card"], corner_radius=10)
+        table_wrap.grid(row=0, column=0, sticky="nsew")
+        table_wrap.grid_rowconfigure(1, weight=1)
+        table_wrap.grid_columnconfigure(0, weight=1)
 
-        header = ctk.CTkFrame(table_wrap, fg_color=("gray88", "gray28"), corner_radius=0)
-        header.pack(fill="x", padx=12, pady=(12, 0))
+        col_header = ctk.CTkFrame(table_wrap, fg_color=("gray88", "gray28"), corner_radius=0)
+        col_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 0))
         for i, (title, width) in enumerate(self.TABLE_HEADERS):
-            header.grid_columnconfigure(i, weight=1, uniform="col")
+            col_header.grid_columnconfigure(i, weight=1, uniform="col")
             ctk.CTkLabel(
-                header,
+                col_header,
                 text=title,
                 width=width,
                 anchor="center",
                 font=("Segoe UI", 11, "bold"),
             ).grid(row=0, column=i, sticky="nsew", padx=4, pady=8)
 
-        self.rows_frame = ctk.CTkScrollableFrame(table_wrap, fg_color="transparent", height=300)
-        self.rows_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.rows_frame = ctk.CTkScrollableFrame(table_wrap, fg_color="transparent")
+        self.rows_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
-        ctk.CTkButton(body, text="Close", width=90, fg_color="transparent", command=self._close).pack(
-            anchor="center", pady=(10, 0)
+        ctk.CTkButton(footer, text="Close", width=90, height=36, fg_color="transparent", command=self._close).pack(
+            anchor="center"
         )
         self._reload_rows()
-        self.after(80, lambda: (self.lift(), self.focus_force()))
+        show_dialog(self, master)
 
     def _close(self) -> None:
         self.destroy()
@@ -898,6 +914,7 @@ class PlanningPanel(ctk.CTkFrame):
     def __init__(self, master, state: AppState, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.state = state
+        self._can_write = state.user.can_write(MOD_DESIGN_PLANNING)
         today = date.today()
         self.view_year = today.year
         self.view_month = today.month
@@ -924,6 +941,7 @@ class PlanningPanel(ctk.CTkFrame):
         toolbar.pack(fill="x", padx=20, pady=(0, 10))
         tb = ctk.CTkFrame(toolbar, fg_color="transparent")
         tb.pack(fill="x", padx=14, pady=10)
+        write_state = "normal" if self._can_write else "disabled"
         ctk.CTkButton(
             tb,
             text="+ Add Plan",
@@ -931,6 +949,7 @@ class PlanningPanel(ctk.CTkFrame):
             height=34,
             fg_color=COLORS["accent"][1],
             command=self._open_add_plan,
+            state=write_state,
         ).pack(side="left", padx=(0, 8))
         ctk.CTkButton(tb, text="Check Plan", width=110, height=34, command=self._open_check_plan).pack(side="left", padx=4)
         ctk.CTkButton(tb, text="Reminders", width=110, height=34, command=self._open_reminders).pack(side="left", padx=4)
@@ -1129,6 +1148,7 @@ class PlanningPanel(ctk.CTkFrame):
             on_remove=self._remove_entry,
             on_refresh=self._reload_calendar,
             on_add_plan=lambda d=day: self._open_add_plan_for_day(d),
+            can_write=self._can_write,
         )
         self._reload_calendar()
 
@@ -1165,11 +1185,24 @@ class PlanningPanel(ctk.CTkFrame):
             lookup_from_ol=self._lookup_from_ol,
         )
 
+    def _require_write(self) -> bool:
+        if self._can_write:
+            return True
+        messagebox.showwarning(
+            "Planning",
+            "Role của bạn chỉ được xem/lọc. Cần role Design hoặc Admin để ghi.",
+        )
+        return False
+
     def _save_plan(self, payload: dict) -> None:
+        if not self._require_write():
+            return
         self._insert_plan(payload)
         messagebox.showinfo("Planning", "Plan saved successfully.")
 
     def _save_plans_batch(self, plans: list[dict]) -> None:
+        if not self._require_write():
+            return
         for payload in plans:
             self._insert_plan(payload, refresh=False)
         self._reload_calendar()
@@ -1186,7 +1219,7 @@ class PlanningPanel(ctk.CTkFrame):
             verify_date=str(payload["verify_date"]),
             verify_date_iso=str(payload["verify_date_iso"]),
             session=str(payload["session"]),
-            created_by=self.state.user.id,
+            created_by=self.state.user.numeric_id(),
             actor=actor,
         )
         iso = str(payload["plan_date_iso"])
@@ -1222,9 +1255,14 @@ class PlanningPanel(ctk.CTkFrame):
         )
 
     def _confirm_delivery(self, entry_id: int) -> None:
+        if not self._require_write():
+            return
         actor = self.state.user.display_name or self.state.user.username
         self.state.db.update_planning_check_status(
-            entry_id, "confirmed", check_by=actor, actor_user_id=self.state.user.id
+            entry_id,
+            "confirmed",
+            check_by=actor,
+            actor_user_id=self.state.user.numeric_id(),
         )
 
     def _prepare_entry(self, entry_id: int, on_done=None) -> None:
@@ -1246,9 +1284,13 @@ class PlanningPanel(ctk.CTkFrame):
             on_done()
 
     def _remove_entry(self, entry_id: int) -> None:
+        if not self._require_write():
+            return
         actor = self.state.user.display_name or self.state.user.username
         if self.state.db.soft_delete_planning_entry(
-            entry_id, deleted_by=actor, actor_user_id=self.state.user.id
+            entry_id,
+            deleted_by=actor,
+            actor_user_id=self.state.user.numeric_id(),
         ):
             messagebox.showinfo("Planning", "Plan removed from calendar.")
         else:
@@ -1265,21 +1307,20 @@ class CheckPlanDialog(ctk.CTkToplevel):
         self.on_verify = on_verify
         self.entries = entries
         self.title("Check Plan")
-        self.geometry("760x520")
+        configure_dialog(self, width=820, height=580, min_width=720, min_height=480, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=20, pady=16)
-        ctk.CTkLabel(body, text="Check Plan — This Month", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        _, header, content, footer = create_dialog_layout(self)
+        ctk.CTkLabel(header, text="Check Plan — This Month", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ctk.CTkLabel(
-            body,
+            header,
             text=(
                 "Review every plan scheduled in the current calendar month. "
                 "Use this to confirm delivery checks or spot misses (red / overdue items)."
             ),
             font=FONT_SMALL,
             text_color=COLORS["muted"],
-            wraplength=700,
+            wraplength=760,
             justify="left",
         ).pack(anchor="w", pady=(4, 4))
         pending = [e for e in entries if effective_check_status(e) != "confirmed"]
@@ -1291,21 +1332,25 @@ class CheckPlanDialog(ctk.CTkToplevel):
             ]
         )
         ctk.CTkLabel(
-            body,
+            header,
             text=f"{len(entries)} total · {len(pending)} pending · {overdue_count} overdue",
             font=FONT_SMALL,
             text_color=COLORS["muted"],
-        ).pack(anchor="w", pady=(4, 12))
+        ).pack(anchor="w", pady=(4, 8))
 
-        scroll = ctk.CTkScrollableFrame(body, fg_color=COLORS["card"], corner_radius=10)
-        scroll.pack(fill="both", expand=True)
+        scroll = ctk.CTkScrollableFrame(content, fg_color=COLORS["card"], corner_radius=10)
+        scroll.grid(row=0, column=0, sticky="nsew")
 
         if not entries:
             ctk.CTkLabel(scroll, text="No plans for this month.", font=FONT_BODY).pack(pady=20)
-            return
+        else:
+            for entry in entries:
+                self._row(scroll, entry)
 
-        for entry in entries:
-            self._row(scroll, entry)
+        ctk.CTkButton(footer, text="Close", width=90, height=36, fg_color="transparent", command=self.destroy).pack(
+            side="right"
+        )
+        show_dialog(self, master)
 
     def _row(self, parent, entry: dict) -> None:
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1341,27 +1386,25 @@ class PlanningLogDialog(ctk.CTkToplevel):
     def __init__(self, master, *, entries: list[dict], month_title: str):
         super().__init__(master)
         self.title("Planning Log")
-        self.geometry("980x520")
-        self.minsize(780, 420)
+        configure_dialog(self, width=1000, height=600, min_width=820, min_height=480, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=20, pady=16)
-        ctk.CTkLabel(body, text="Planning Log", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        _, header, content, footer = create_dialog_layout(self)
+        ctk.CTkLabel(header, text="Planning Log", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ctk.CTkLabel(
-            body,
+            header,
             text=(
                 f"Activity for {month_title} — create, remove, confirm, prepare. "
                 "Removed plans stay in the database but no longer appear on the calendar."
             ),
             font=FONT_SMALL,
             text_color=COLORS["muted"],
-            wraplength=860,
+            wraplength=900,
             justify="left",
-        ).pack(anchor="w", pady=(4, 12))
+        ).pack(anchor="w", pady=(4, 8))
 
-        header = ctk.CTkFrame(body, fg_color=("gray88", "gray28"), corner_radius=8)
-        header.pack(fill="x", pady=(0, 8))
+        col_header = ctk.CTkFrame(header, fg_color=("gray88", "gray28"), corner_radius=8)
+        col_header.pack(fill="x", pady=(0, 4))
         for col, width in [
             ("Time", 140),
             ("Action", 120),
@@ -1372,15 +1415,15 @@ class PlanningLogDialog(ctk.CTkToplevel):
             ("By", 88),
         ]:
             ctk.CTkLabel(
-                header,
+                col_header,
                 text=col,
                 width=width,
                 anchor="center",
                 font=("Segoe UI", 11, "bold"),
             ).pack(side="left", padx=4, pady=8)
 
-        scroll = ctk.CTkScrollableFrame(body, fg_color=COLORS["card"], corner_radius=10)
-        scroll.pack(fill="both", expand=True)
+        scroll = ctk.CTkScrollableFrame(content, fg_color=COLORS["card"], corner_radius=10)
+        scroll.grid(row=0, column=0, sticky="nsew")
 
         if not entries:
             ctk.CTkLabel(
@@ -1393,8 +1436,8 @@ class PlanningLogDialog(ctk.CTkToplevel):
             for idx, entry in enumerate(entries):
                 self._row(scroll, entry, idx)
 
-        ctk.CTkButton(body, text="Close", width=90, command=self.destroy).pack(anchor="e", pady=(12, 0))
-        self.after(80, lambda: (self.lift(), self.focus_force()))
+        ctk.CTkButton(footer, text="Close", width=90, height=36, command=self.destroy).pack(side="right")
+        show_dialog(self, master)
 
     def _row(self, parent, entry: dict, row_idx: int) -> None:
         action = str(entry.get("action", ""))
@@ -1437,34 +1480,33 @@ class RemindersDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.on_verify = on_verify
         self.title("Reminders")
-        self.geometry("720x460")
+        configure_dialog(self, width=780, height=520, min_width=680, min_height=420, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
 
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=20, pady=16)
-        ctk.CTkLabel(body, text="Reminders — Next 7 Days", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        _, header, content, footer = create_dialog_layout(self)
+        ctk.CTkLabel(header, text="Reminders — Next 7 Days", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ctk.CTkLabel(
-            body,
+            header,
             text=(
                 "Shows plans whose Verify Date falls within the next 7 days and are not yet confirmed. "
                 "Use this as a short-term to-do list before items become Miss."
             ),
             font=FONT_SMALL,
             text_color=COLORS["muted"],
-            wraplength=660,
+            wraplength=720,
             justify="left",
         ).pack(anchor="w", pady=(4, 4))
         ctk.CTkLabel(
-            body,
+            header,
             text="Tip: Check Plan = full month audit · Reminders = near-term deadlines only.",
             font=FONT_SMALL,
             text_color=COLORS["accent"][1],
-            wraplength=660,
+            wraplength=720,
             justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
-        scroll = ctk.CTkScrollableFrame(body, fg_color=COLORS["card"], corner_radius=10)
-        scroll.pack(fill="both", expand=True)
+        scroll = ctk.CTkScrollableFrame(content, fg_color=COLORS["card"], corner_radius=10)
+        scroll.grid(row=0, column=0, sticky="nsew")
 
         if not reminders:
             ctk.CTkLabel(
@@ -1473,24 +1515,30 @@ class RemindersDialog(ctk.CTkToplevel):
                 font=FONT_BODY,
                 text_color=COLORS["success"][1],
             ).pack(pady=24)
-            return
+        else:
+            for entry in reminders:
+                row = ctk.CTkFrame(scroll, fg_color="transparent")
+                row.pack(fill="x", padx=10, pady=6)
+                due = str(entry.get("verify_date", ""))
+                text = (
+                    f"Verify by {due} · {entry.get('dg_case')} · {entry.get('item_code')} · "
+                    f"{entry.get('supplier', '')} · Plan {entry.get('plan_date')} · Qty {entry.get('quantity')}"
+                )
+                ctk.CTkLabel(row, text=text, font=FONT_SMALL, anchor="w").pack(
+                    side="left", fill="x", expand=True
+                )
+                ctk.CTkButton(
+                    row,
+                    text="Confirm",
+                    width=70,
+                    height=28,
+                    command=lambda eid=int(entry["id"]): self._verify(eid),
+                ).pack(side="right")
 
-        for entry in reminders:
-            row = ctk.CTkFrame(scroll, fg_color="transparent")
-            row.pack(fill="x", padx=10, pady=6)
-            due = str(entry.get("verify_date", ""))
-            text = (
-                f"Verify by {due} · {entry.get('dg_case')} · {entry.get('item_code')} · "
-                f"{entry.get('supplier', '')} · Plan {entry.get('plan_date')} · Qty {entry.get('quantity')}"
-            )
-            ctk.CTkLabel(row, text=text, font=FONT_SMALL, anchor="w").pack(side="left", fill="x", expand=True)
-            ctk.CTkButton(
-                row,
-                text="Confirm",
-                width=70,
-                height=28,
-                command=lambda eid=int(entry["id"]): self._verify(eid),
-            ).pack(side="right")
+        ctk.CTkButton(footer, text="Close", width=90, height=36, fg_color="transparent", command=self.destroy).pack(
+            side="right"
+        )
+        show_dialog(self, master)
 
     def _verify(self, entry_id: int) -> None:
         self.on_verify(entry_id)

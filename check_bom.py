@@ -194,15 +194,24 @@ def extract_item_code_from_product_code(product_code: object) -> str:
     return ""
 
 
-def normalized_pm_quantity(row: pd.Series) -> float | None:
-    """So luong cot P (so_luong) chia cho cot G bang ke truoc khi so sanh."""
-    qty = safe_float(row.get("so_luong"))
-    if qty is None:
+def normalized_npl_qty_per_unit(row: pd.Series) -> float | None:
+    """SL NPL / 1 SP khi so sanh: uu tien cot O; neu trong thi P / order_qty (G)."""
+    from core.bom_ke_columns import NPL_QTY_ORDER, NPL_QTY_PER_UNIT, ORDER_QTY
+
+    per_unit = safe_float(row.get(NPL_QTY_PER_UNIT))
+    if per_unit is not None:
+        return per_unit
+    total = safe_float(row.get(NPL_QTY_ORDER))
+    if total is None:
         return None
-    g = safe_float(row.get("qty_divisor"))
-    if g is None or g == 0:
-        return qty
-    return qty / g
+    order_qty = safe_float(row.get(ORDER_QTY))
+    if order_qty is None or order_qty == 0:
+        return total
+    return total / order_qty
+
+
+# Ten cu (check_bom noi bo)
+normalized_pm_quantity = normalized_npl_qty_per_unit
 
 
 def round_measure_value(value: float | None, dvt: object) -> float | None:
@@ -547,19 +556,35 @@ class ExcelParser:
         if df_raw.shape[1] < 16:
             raise ValueError("Bang ke khong du cot (can toi thieu cot P).")
 
+        from core.bom_ke_columns import (
+            COL_DG_CASE,
+            COL_DON_VI_TINH,
+            COL_MA_NPL,
+            COL_MO_TA,
+            COL_NPL_QTY_ORDER,
+            COL_NPL_QTY_PER_UNIT,
+            COL_ORDER_DATE,
+            COL_ORDER_QTY,
+            COL_PRODUCT_CODE,
+            COL_TEN_NPL,
+            NPL_QTY_ORDER,
+            NPL_QTY_PER_UNIT,
+            ORDER_QTY,
+        )
+
         out = pd.DataFrame(
             {
                 "row_index": df_raw.index + 1,
-                "dg_case": df_raw.iloc[:, 0].map(normalize_text),
-                "order_date": pd.to_datetime(df_raw.iloc[:, 1], errors="coerce"),
-                "product_code": df_raw.iloc[:, 3].map(normalize_text),
-                "qty_divisor": pd.to_numeric(df_raw.iloc[:, 6], errors="coerce"),
-                "ma_npl": df_raw.iloc[:, 9].map(normalize_text),
-                "ten_npl": df_raw.iloc[:, 10].map(normalize_text),
-                "mo_ta": df_raw.iloc[:, 11].map(normalize_text),
-                "don_vi_tinh": df_raw.iloc[:, 13].map(normalize_text),
-                "so_luong_dm_1": pd.to_numeric(df_raw.iloc[:, 14], errors="coerce"),
-                "so_luong": pd.to_numeric(df_raw.iloc[:, 15], errors="coerce"),
+                "dg_case": df_raw.iloc[:, COL_DG_CASE].map(normalize_text),
+                "order_date": pd.to_datetime(df_raw.iloc[:, COL_ORDER_DATE], errors="coerce"),
+                "product_code": df_raw.iloc[:, COL_PRODUCT_CODE].map(normalize_text),
+                ORDER_QTY: pd.to_numeric(df_raw.iloc[:, COL_ORDER_QTY], errors="coerce"),
+                "ma_npl": df_raw.iloc[:, COL_MA_NPL].map(normalize_text),
+                "ten_npl": df_raw.iloc[:, COL_TEN_NPL].map(normalize_text),
+                "mo_ta": df_raw.iloc[:, COL_MO_TA].map(normalize_text),
+                "don_vi_tinh": df_raw.iloc[:, COL_DON_VI_TINH].map(normalize_text),
+                NPL_QTY_PER_UNIT: pd.to_numeric(df_raw.iloc[:, COL_NPL_QTY_PER_UNIT], errors="coerce"),
+                NPL_QTY_ORDER: pd.to_numeric(df_raw.iloc[:, COL_NPL_QTY_ORDER], errors="coerce"),
             }
         )
         out["customer_code"] = out["product_code"].map(extract_customer_code_from_product_code)
@@ -760,8 +785,8 @@ class BomComparator:
                         dvt=normalize_text(o_row["don_vi_tinh"]),
                         sldm1_ke=None,
                         so_luong_ke=None,
-                        sldm1_bom=safe_float(o_row["so_luong_dm_1"]),
-                        so_luong_bom=normalized_pm_quantity(o_row),
+                        sldm1_bom=safe_float(o_row["npl_qty_per_unit"]),
+                        so_luong_bom=normalized_npl_qty_per_unit(o_row),
                         khac=pair_txt,
                         chi_tiet="Co trong don doi chieu, khong co o tieu diem",
                         trang_thai="❌",
@@ -777,8 +802,8 @@ class BomComparator:
                         ten_npl=normalize_text(f_row["ten_npl"]),
                         mo_ta=normalize_text(f_row["mo_ta"]),
                         dvt=normalize_text(f_row["don_vi_tinh"]),
-                        sldm1_ke=safe_float(f_row["so_luong_dm_1"]),
-                        so_luong_ke=normalized_pm_quantity(f_row),
+                        sldm1_ke=safe_float(f_row["npl_qty_per_unit"]),
+                        so_luong_ke=normalized_npl_qty_per_unit(f_row),
                         sldm1_bom=None,
                         so_luong_bom=None,
                         khac=pair_txt,
@@ -791,10 +816,10 @@ class BomComparator:
                 continue
 
             dvt = normalize_text(f_row["don_vi_tinh"] or o_row["don_vi_tinh"])
-            f_sldm = safe_float(f_row["so_luong_dm_1"])
-            o_sldm = safe_float(o_row["so_luong_dm_1"])
-            f_qty_n = normalized_pm_quantity(f_row)
-            o_qty_n = normalized_pm_quantity(o_row)
+            f_sldm = safe_float(f_row["npl_qty_per_unit"])
+            o_sldm = safe_float(o_row["npl_qty_per_unit"])
+            f_qty_n = normalized_npl_qty_per_unit(f_row)
+            o_qty_n = normalized_npl_qty_per_unit(o_row)
             sldm_ok = self.is_sldm1_match(f_sldm, o_sldm)
             qty_ok = self.is_quantity_match(dvt, f_qty_n, o_qty_n)
             ok = sldm_ok and qty_ok
@@ -839,8 +864,8 @@ class BomComparator:
                         ten_npl=normalize_text(row["ten_npl"]),
                         mo_ta=normalize_text(row["mo_ta"]),
                         dvt=normalize_text(row["don_vi_tinh"]),
-                        sldm1_ke=safe_float(row["so_luong_dm_1"]),
-                        so_luong_ke=safe_float(row["so_luong"]),
+                        sldm1_ke=safe_float(row["npl_qty_per_unit"]),
+                        so_luong_ke=safe_float(row["npl_qty_order"]),
                         sldm1_bom=None,
                         so_luong_bom=None,
                         khac=dg_case,
@@ -856,9 +881,9 @@ class BomComparator:
                 continue
 
             dvt = normalize_text(row["don_vi_tinh"])
-            ke_sldm1 = safe_float(row["so_luong_dm_1"])
-            # Check Excel: lay nguyen cot P bang ke, KHONG chia cot G.
-            ke_qty = safe_float(row["so_luong"])
+            ke_sldm1 = safe_float(row["npl_qty_per_unit"])
+            # Check Excel: so sanh npl_qty_order (P) voi cot I/K Excel — khong chia order_qty.
+            ke_qty = safe_float(row["npl_qty_order"])
             bom_h = safe_float(bom_row["sldm1_h"])
             bom_i = safe_float(bom_row["so_luong_i"])
             bom_dvt = normalize_text(bom_row.get("dvt_excel", "")) or dvt

@@ -323,6 +323,37 @@ class OlReaderService:
             "quantity": self._format_qty(total_qty) if has_qty else "",
         }
 
+    def lookup_fields_for_dg_case(self, df: pd.DataFrame, dg_case: str) -> dict[str, str]:
+        """Color, Logo (cột J), production_no, item_code theo DG Case — dùng Supplier slip."""
+        matches = self.find_by_dg_case(df, dg_case)
+        empty = {
+            "production_no": "",
+            "item_code": "",
+            "color": "",
+            "logo": "",
+            "supplier": "",
+        }
+        if matches.empty:
+            return empty
+
+        def _first_col(col: str) -> str:
+            if col not in matches.columns:
+                return ""
+            for val in matches[col]:
+                text = normalize_text(val)
+                if text:
+                    return text
+            return ""
+
+        production_no = _first_col("production_no")
+        return {
+            "production_no": production_no,
+            "item_code": _first_col("item_code") or extract_item_code_from_product_code(production_no),
+            "color": _first_col("color"),
+            "logo": _first_col("logo"),
+            "supplier": _first_col("supplier"),
+        }
+
     def filter_by_order_date(self, df: pd.DataFrame, order_date: str) -> pd.DataFrame:
         if df.empty:
             return df
