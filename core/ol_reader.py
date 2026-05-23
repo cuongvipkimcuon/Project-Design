@@ -138,7 +138,17 @@ class OlReaderService:
 
         if not rows:
             return pd.DataFrame(columns=OL_COLUMNS)
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        df["_dg_norm"] = df["dg_case"].map(normalize_dg_case)
+        return df
+
+    @staticmethod
+    def ensure_dg_norm(df: pd.DataFrame | None) -> pd.DataFrame | None:
+        if df is None or df.empty or "_dg_norm" in df.columns:
+            return df
+        out = df.copy()
+        out["_dg_norm"] = out["dg_case"].map(normalize_dg_case)
+        return out
 
     def load_for_today(
         self,
@@ -233,6 +243,7 @@ class OlReaderService:
         df = self.db.load_active_ol_df()
         if df is None:
             return None
+        df = self.ensure_dg_norm(df)
         read_at = self.db.get_setup("ol_active_read_at", "")
         file_name = normalize_text(meta.get("file_name"))
         when = f", đọc lúc {read_at}" if read_at else ""
@@ -266,12 +277,17 @@ class OlReaderService:
 
     def find_by_dg_case(self, df: pd.DataFrame, dg_case: str) -> pd.DataFrame:
         key = normalize_dg_case(dg_case)
-        if not key or df.empty:
+        if not key or df.empty or "dg_case" not in df.columns:
             return df.iloc[0:0].copy()
-        mask = df["dg_case"].map(
-            lambda x: key == normalize_dg_case(x) or key in normalize_dg_case(x)
-        )
-        return df[mask].copy()
+        if "_dg_norm" not in df.columns:
+            norm = df["dg_case"].map(normalize_dg_case)
+        else:
+            norm = df["_dg_norm"]
+        exact = norm == key
+        if exact.any():
+            return df.loc[exact].copy()
+        partial = norm.str.contains(key, regex=False, na=False)
+        return df.loc[partial].copy()
 
     @staticmethod
     def _qty_total(values) -> tuple[float, bool]:

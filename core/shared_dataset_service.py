@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -11,10 +12,23 @@ from typing import Any
 import pandas as pd
 
 from core.bom_ke_reader import BomKeLoadResult, BomKeReaderService
+from core.team_pull_meta import mark_team_bom_pulled, mark_team_ol_pulled
 from core.database import HubDatabase
+from core.emg_scanner_reader import clear_emg_cache
 from core.ol_reader import OL_COLUMNS, OlLoadResult, OlReaderService
 from core.user_cloud import UserCloud
-from core.utils import normalize_text
+from core.utils import compute_file_md5, normalize_text
+
+
+@dataclass
+class TeamPullResult:
+    messages: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    ol_result: OlLoadResult | None = None
+    bom_result: BomKeLoadResult | None = None
+    ops_pulled: bool = False
+    ops_pushed: bool = False
+    ops_version: int = 0
 
 
 @dataclass
@@ -203,6 +217,8 @@ class SharedDatasetService:
 
         pub = normalize_text(row.get("publisher_name")) or "admin"
         when = normalize_text(row.get("published_at"))[:16]
+        content_hash = normalize_text(row.get("content_hash")) or file_hash
+        mark_team_ol_pulled(self.db, content_hash=content_hash)
         return OlLoadResult(
             source="team_cloud",
             snapshot_date=snapshot_date,
@@ -245,6 +261,7 @@ class SharedDatasetService:
                 f"Đã tải file bảng kê ({result.row_count:,} dòng, parse local) — {pub}, {when}."
             )
             result.source = "team_cloud_file"
+            mark_team_bom_pulled(self.db, content_hash=content_hash)
             return result
 
         row = self.cloud.get_active_team_dataset("bom_ke")
@@ -265,6 +282,7 @@ class SharedDatasetService:
             file_path, file_name, file_hash, a6_text, a6_hash, len(df)
         )
         self.db.set_setup("bom_link", file_path)
+        mark_team_bom_pulled(self.db, content_hash=a6_hash)
 
         return BomKeLoadResult(
             source="team_cloud",
@@ -277,3 +295,264 @@ class SharedDatasetService:
             message=f"Đã tải bảng kê dùng chung ({len(df):,} dòng JSON) — {pub}, {when}.",
             df=df,
         )
+
+    def _team_template_cache_path(self, file_name: str, content_hash: str) -> Path:
+        cache = Path(self.db.db_file).resolve().parent / "team_cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in file_name)[:80]
+        return cache / f"supplier_tpl_{content_hash[:12]}_{safe}"
+
+    def publish_supplier_template(self, *, publisher_name: str) -> str:
+        from core.supplier_excel_export import (
+            SETUP_KEY_TEMPLATE_CLOUD_HASH,
+            SETUP_KEY_TEMPLATE_PATH,
+            resolve_supplier_template_path,
+        )
+
+        tpl_path = resolve_supplier_template_path(self.db)
+        path = Path(tpl_path)
+        if not path.is_file():
+            raise ValueError("Không tìm thấy file template — chọn file trong Setup trước.")
+        file_name = path.name
+        file_hash = compute_file_md5(str(path))
+        if not self.cloud_enabled:
+            raise RuntimeError("Cloud chưa bật — đăng nhập Supabase và cấu hình .env.")
+        self.cloud.publish_team_excel_file(
+            dataset_type="supplier_template",
+            publisher_name=publisher_name,
+            file_name=file_name,
+            file_path=str(path),
+            file_hash=file_hash,
+            content_hash=file_hash,
+            row_count=0,
+            meta={"kind": "supplier_slip_template"},
+            excel_path=str(path),
+        )
+        self.db.set_setup(SETUP_KEY_TEMPLATE_PATH, str(path))
+        self.db.set_setup("supplier_template_file_name", file_name)
+        self.db.set_setup(SETUP_KEY_TEMPLATE_CLOUD_HASH, file_hash)
+        kb = path.stat().st_size // 1024
+        return f"Đã chia sẻ template phiếu ({file_name}, {kb} KB) lên cloud."
+
+    def pull_supplier_template(self) -> str:
+        import hashlib
+
+        from core.supplier_excel_export import SETUP_KEY_TEMPLATE_CLOUD_HASH, SETUP_KEY_TEMPLATE_PATH
+
+        if not self.cloud_enabled:
+            raise RuntimeError("Cloud chưa bật.")
+        header = self.cloud.get_active_team_dataset_header("supplier_template")
+        if not header:
+            raise ValueError("Admin chưa chia sẻ template phiếu — liên hệ admin.")
+        if str(header.get("storage_format") or "") != "excel_gzip":
+            raise ValueError("Template trên cloud không đúng định dạng — admin chia sẻ lại.")
+        _, xlsx_bytes = self.cloud.fetch_team_excel_bytes("supplier_template")
+        if not xlsx_bytes:
+            raise ValueError("Không tải được template từ cloud.")
+        file_name = normalize_text(header.get("file_name")) or "supplier_template.xlsx"
+        content_hash = normalize_text(header.get("content_hash")) or hashlib.md5(xlsx_bytes).hexdigest()
+        local_path = self._team_template_cache_path(file_name, content_hash)
+        local_path.write_bytes(xlsx_bytes)
+        self.db.set_setup(SETUP_KEY_TEMPLATE_PATH, str(local_path))
+        self.db.set_setup("supplier_template_file_name", file_name)
+        self.db.set_setup(SETUP_KEY_TEMPLATE_CLOUD_HASH, content_hash)
+        pub = normalize_text(header.get("publisher_name")) or "admin"
+        when = normalize_text(header.get("published_at"))[:16]
+        kb = len(xlsx_bytes) // 1024
+        return f"Đã tải template dùng chung ({file_name}, {kb} KB) — {pub}, {when}."
+
+    def sync_supplier_template_if_needed(self) -> str | None:
+        """Tự tải template mới từ cloud nếu admin đã cập nhật."""
+        from core.supplier_excel_export import SETUP_KEY_TEMPLATE_CLOUD_HASH, SETUP_KEY_TEMPLATE_PATH
+
+        if not self.cloud_enabled:
+            return None
+        header = self.cloud.get_active_team_dataset_header("supplier_template")
+        if not header:
+            return None
+        content_hash = normalize_text(header.get("content_hash"))
+        if not content_hash:
+            return None
+        local_hash = normalize_text(self.db.get_setup(SETUP_KEY_TEMPLATE_CLOUD_HASH, ""))
+        local_path = normalize_text(self.db.get_setup(SETUP_KEY_TEMPLATE_PATH, ""))
+        if content_hash == local_hash and local_path and Path(local_path).is_file():
+            return None
+        try:
+            return self.pull_supplier_template()
+        except Exception as exc:
+            print(f"[SharedDataset] sync supplier template: {exc}")
+            return None
+
+    def _team_file_cache_path(self, prefix: str, file_name: str, content_hash: str) -> Path:
+        cache = Path(self.db.db_file).resolve().parent / "team_cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in file_name)[:80]
+        return cache / f"{prefix}_{content_hash[:12]}_{safe}"
+
+    def publish_detail_rules(self, *, publisher_name: str) -> str:
+        from core.supplier_detail_rules import (
+            SETUP_KEY_TEAM,
+            SETUP_KEY_TEAM_HASH,
+            load_team_detail_rules,
+        )
+
+        rules = load_team_detail_rules(self.db)
+        raw = json.dumps(rules, ensure_ascii=False).encode("utf-8")
+        content_hash = hashlib.md5(raw).hexdigest()
+        if not self.cloud_enabled:
+            raise RuntimeError("Cloud chưa bật — đăng nhập Supabase và cấu hình .env.")
+        self.cloud.publish_team_dataset(
+            dataset_type="supplier_detail_rules",
+            publisher_name=publisher_name,
+            file_name="supplier_detail_rules.json",
+            file_path=SETUP_KEY_TEAM,
+            file_hash=content_hash,
+            content_hash=content_hash,
+            row_count=len(rules),
+            meta={"kind": "supplier_detail_rules"},
+            rows_data=rules,
+        )
+        self.db.set_setup(SETUP_KEY_TEAM_HASH, content_hash, sync_cloud=False)
+        return f"Đã chia sẻ quy tắc Detail ({len(rules)} quy tắc team) lên cloud."
+
+    def pull_detail_rules(self) -> str:
+        from core.supplier_detail_rules import (
+            SETUP_KEY_TEAM,
+            SETUP_KEY_TEAM_HASH,
+            save_team_detail_rules,
+        )
+
+        if not self.cloud_enabled:
+            raise RuntimeError("Cloud chưa bật.")
+        row = self.cloud.get_active_team_dataset("supplier_detail_rules")
+        if not row:
+            raise ValueError("Admin chưa chia sẻ quy tắc Detail.")
+        records = row.get("rows_data") or []
+        if isinstance(records, str):
+            records = json.loads(records)
+        if not isinstance(records, list):
+            records = []
+        content_hash = normalize_text(row.get("content_hash")) or ""
+        save_team_detail_rules(self.db, list(records))
+        self.db.set_setup(SETUP_KEY_TEAM_HASH, content_hash, sync_cloud=False)
+        pub = normalize_text(row.get("publisher_name")) or "admin"
+        when = normalize_text(row.get("published_at"))[:16]
+        return f"Đã tải quy tắc Detail team ({len(records)} quy tắc) — {pub}, {when}."
+
+    def publish_emg_scanner(self, *, publisher_name: str) -> str:
+        from core.emg_scanner_reader import resolve_emg_scanner_path
+
+        path = resolve_emg_scanner_path(self.db)
+        if not path or not path.is_file():
+            raise ValueError("Không tìm thấy file EMG scanner — chọn file trong Setup trước.")
+        file_name = path.name
+        file_hash = compute_file_md5(str(path))
+        if not self.cloud_enabled:
+            raise RuntimeError("Cloud chưa bật.")
+        self.cloud.publish_team_excel_file(
+            dataset_type="emg_scanner",
+            publisher_name=publisher_name,
+            file_name=file_name,
+            file_path=str(path),
+            file_hash=file_hash,
+            content_hash=file_hash,
+            row_count=0,
+            meta={"kind": "emg_scanner_json"},
+            excel_path=str(path),
+        )
+        self.db.set_setup("emg_scanner_cloud_hash", file_hash, sync_cloud=False)
+        mb = path.stat().st_size / (1024 * 1024)
+        return f"Đã chia sẻ EMG scanner ({file_name}, ~{mb:.1f} MB) lên cloud."
+
+    def pull_emg_scanner(self) -> str:
+        if not self.cloud_enabled:
+            raise RuntimeError("Cloud chưa bật.")
+        header = self.cloud.get_active_team_dataset_header("emg_scanner")
+        if not header:
+            raise ValueError("Admin chưa chia sẻ EMG scanner.")
+        if str(header.get("storage_format") or "") != "excel_gzip":
+            raise ValueError("EMG trên cloud không đúng định dạng.")
+        _, blob = self.cloud.fetch_team_excel_bytes("emg_scanner")
+        if not blob:
+            raise ValueError("Không tải được EMG scanner từ cloud.")
+        file_name = normalize_text(header.get("file_name")) or "emg_scanner_export.json"
+        content_hash = normalize_text(header.get("content_hash")) or hashlib.md5(blob).hexdigest()
+        local_path = self._team_file_cache_path("emg_scanner", file_name, content_hash)
+        local_path.write_bytes(blob)
+        clear_emg_cache()
+        self.db.set_setup("emg_scanner_json_path", str(local_path), sync_cloud=False)
+        self.db.set_setup("emg_scanner_cloud_hash", content_hash, sync_cloud=False)
+        pub = normalize_text(header.get("publisher_name")) or "admin"
+        when = normalize_text(header.get("published_at"))[:16]
+        mb = len(blob) / (1024 * 1024)
+        return f"Đã tải EMG scanner ({file_name}, ~{mb:.1f} MB) — {pub}, {when}."
+
+    def publish_all_team_data(self, *, publisher_name: str) -> list[str]:
+        msgs: list[str] = []
+        for label, fn in [
+            ("OL", lambda: self.publish_ol(publisher_name=publisher_name)),
+            ("Bảng kê", lambda: self.publish_bom_ke(publisher_name=publisher_name)),
+            ("Template phiếu", lambda: self.publish_supplier_template(publisher_name=publisher_name)),
+            ("Quy tắc Detail", lambda: self.publish_detail_rules(publisher_name=publisher_name)),
+            ("EMG scanner", lambda: self.publish_emg_scanner(publisher_name=publisher_name)),
+        ]:
+            try:
+                msgs.append(fn())
+            except Exception as exc:
+                msgs.append(f"{label}: {exc}")
+        return msgs
+
+    def pull_all_team_data(self, *, skip_missing: bool = True) -> TeamPullResult:
+        result = TeamPullResult()
+
+        def _pull(label: str, fn) -> None:
+            try:
+                out = fn()
+                if isinstance(out, OlLoadResult):
+                    result.ol_result = out
+                    result.messages.append(out.message)
+                elif isinstance(out, BomKeLoadResult):
+                    result.bom_result = out
+                    result.messages.append(out.message)
+                else:
+                    result.messages.append(str(out))
+            except Exception as exc:
+                text = f"{label}: {exc}"
+                if skip_missing:
+                    result.errors.append(text)
+                else:
+                    raise RuntimeError(text) from exc
+
+        if not self.cloud_enabled:
+            raise RuntimeError("Cloud chưa bật.")
+        _pull("OL", self.pull_ol)
+        _pull("Bảng kê", self.pull_bom_ke)
+        _pull("Template phiếu", self.pull_supplier_template)
+        _pull("Quy tắc Detail", self.pull_detail_rules)
+        _pull("EMG scanner", self.pull_emg_scanner)
+        try:
+            from core.team_ops_sync import TeamOpsSyncService
+
+            ops = TeamOpsSyncService(self.db).sync_bidirectional(
+                actor_name=normalize_text(getattr(self.cloud, "owner_id", "")),
+            )
+            result.ops_pulled = ops.pulled
+            result.ops_pushed = ops.pushed
+            result.ops_version = ops.version
+            if ops.message:
+                result.messages.append(ops.message)
+            if ops.errors:
+                result.errors.extend(ops.errors)
+        except Exception as exc:
+            result.errors.append(f"Plan/phiếu/tồn: {exc}")
+        return result
+
+    def sync_all_team_data_if_needed(self) -> TeamPullResult | None:
+        """Login: tải các bản cloud mới (bỏ qua mục chưa có / lỗi)."""
+        if not self.cloud_enabled:
+            return None
+        try:
+            return self.pull_all_team_data(skip_missing=True)
+        except Exception as exc:
+            print(f"[SharedDataset] sync all: {exc}")
+            return None

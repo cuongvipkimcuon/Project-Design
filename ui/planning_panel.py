@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+from core import supplier_db
 from core.app_state import AppState
 from core.permissions import MOD_DESIGN_PLANNING
 from core.planning_service import (
@@ -17,21 +18,27 @@ from core.planning_service import (
     check_status_label,
     day_all_confirmed,
     day_has_miss,
+    describe_duplicate_plan,
     effective_check_status,
     effective_prepare_status,
+    format_audit_log_line,
     format_check_display,
     format_check_timestamp,
+    format_plan_change_line,
+    format_plan_date_display,
     format_prepare_display,
     import_plans_from_excel,
     iso_in_days,
     iso_today,
     load_excel_mapping,
+    plan_needs_delivery_date,
     prepare_status_label,
     save_excel_mapping,
     validate_plan_payload,
 )
 from core.utils import format_date_dd_mm_yyyy, normalize_text, parse_date_dd_mm_yyyy
 from ui.dialog_utils import configure_dialog, create_dialog_layout, show_dialog
+from ui.table_pager import TablePager, TablePagerBar
 from ui.theme import COLORS, FONT_BODY, FONT_SMALL
 
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -46,12 +53,24 @@ CAL_TODAY = COLORS["accent"][1]
 CAL_SELECTED_BORDER = COLORS["accent"][1]
 CELL_MIN_H = 78
 CELL_MIN_W = 108
-DATE_FIELD_KEYS = frozenset({"plan_date", "verify_date"})
+PLAN_DATE_PICK_KEYS = frozenset({"plan_date", "verify_date"})
 OL_AUTOFILL_TO_FORM = {
     "production_no": "item_code",
     "supplier": "supplier",
     "quantity": "quantity",
 }
+
+
+def confirm_duplicate_plan(master, db, dg_case: str, *, exclude_id: int | None = None) -> bool:
+    dup = db.find_planning_duplicate(dg_case, exclude_id=exclude_id)
+    if not dup:
+        return True
+    msg = (
+        "Đã có plan active cho DG Case này:\n\n"
+        f"{describe_duplicate_plan(dup)}\n\n"
+        "Mỗi DG Case là độc lập — bạn có chắc vẫn tạo/sửa thành plan trùng?"
+    )
+    return messagebox.askyesno("Cảnh báo plan trùng", msg, parent=master)
 
 
 class DatePickerDialog(ctk.CTkToplevel):
@@ -212,7 +231,7 @@ class AddPlanDialog(ctk.CTkToplevel):
             "supplier": ctk.StringVar(),
             "quantity": ctk.StringVar(),
             "plan_date": ctk.StringVar(value=initial_plan_date),
-            "verify_date": ctk.StringVar(),
+            "verify_date": ctk.StringVar(value=format_date_dd_mm_yyyy(date.today())),
             "session": ctk.StringVar(value="—"),
         }
         fields = [
@@ -220,14 +239,14 @@ class AddPlanDialog(ctk.CTkToplevel):
             ("Production No", "item_code", "e.g. mã SP đầy đủ từ OL"),
             ("Supplier", "supplier", "e.g. NCC ABC — giao cho ai"),
             ("Quantity", "quantity", "e.g. 160"),
-            ("Plan Date", "plan_date", "dd-mm-yyyy"),
-            ("Verify Date", "verify_date", "dd-mm-yyyy"),
+            ("Hạn giao tem", "plan_date", "để trống nếu chưa biết"),
+            ("Ngày lập KH", "verify_date", "mặc định hôm nay"),
         ]
         for label, key, placeholder in fields:
             row = ctk.CTkFrame(parent, fg_color="transparent")
             row.pack(fill="x", pady=7)
             ctk.CTkLabel(row, text=label, width=110, anchor="w", font=FONT_BODY).pack(side="left")
-            if key in DATE_FIELD_KEYS:
+            if key in PLAN_DATE_PICK_KEYS:
                 ctk.CTkEntry(
                     row,
                     textvariable=self.vars[key],
@@ -241,7 +260,17 @@ class AddPlanDialog(ctk.CTkToplevel):
                     width=64,
                     height=34,
                     command=lambda k=key, lbl=label: self._pick_date(k, lbl),
-                ).pack(side="left")
+                ).pack(side="left", padx=(0, 4))
+                if key == "plan_date":
+                    ctk.CTkButton(
+                        row,
+                        text="Clear",
+                        width=64,
+                        height=34,
+                        fg_color="transparent",
+                        border_width=1,
+                        command=lambda k=key: self.vars[k].set(""),
+                    ).pack(side="left")
             else:
                 entry = ctk.CTkEntry(
                     row, textvariable=self.vars[key], placeholder_text=placeholder, height=34
@@ -309,8 +338,8 @@ class AddPlanDialog(ctk.CTkToplevel):
             ("Production No", "item_code"),
             ("Supplier", "supplier"),
             ("Quantity", "quantity"),
-            ("Plan Date", "plan_date"),
-            ("Verify Date", "verify_date"),
+            ("Hạn giao tem", "plan_date"),
+            ("Ngày lập KH (opt.)", "verify_date"),
             ("Session (opt.)", "session"),
             ("Start row", "start_row"),
         ]
@@ -389,6 +418,8 @@ class AddPlanDialog(ctk.CTkToplevel):
         except PlanningValidationError as exc:
             messagebox.showerror("Add Plan", str(exc), parent=self)
             return
+        if not confirm_duplicate_plan(self, self.db, payload["dg_case"]):
+            return
         self.on_save(payload)
         self.destroy()
 
@@ -418,12 +449,16 @@ class AddPlanDialog(ctk.CTkToplevel):
 
 
 class PrepareLabelsDialog(ctk.CTkToplevel):
+    AUTO_STOCK_LABEL = "— Tự động —"
+
     TABLE_HEADERS = (
         ("", 36),
-        ("Mã NPL", 108),
-        ("Tên NPL", 220),
-        ("Mô tả", 180),
-        ("Quantity", 80),
+        ("Mã NPL", 100),
+        ("Tên NPL", 180),
+        ("Mô tả", 140),
+        ("Quantity", 72),
+        ("Gợi ý", 88),
+        ("Tồn kho", 148),
     )
 
     def __init__(
@@ -436,16 +471,20 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
         on_saved,
     ):
         super().__init__(master)
-        self.state = state
+        self.app_state = state
         self.entry_id = entry_id
         self.plan = plan
         self.on_saved = on_saved
         self.checkbox_vars: dict[str, ctk.BooleanVar] = {}
+        self.stock_map_vars: dict[str, ctk.StringVar] = {}
         self.candidates: list[dict] = []
+        self._stock_label_to_id: dict[str, int | None] = {self.AUTO_STOCK_LABEL: None}
+        self._stock_id_to_label: dict[int, str] = {}
+        self._stock_choice_labels: list[str] = [self.AUTO_STOCK_LABEL]
 
         already = effective_prepare_status(plan) == "prepared"
         self.title("Update Prepare" if already else "Prepare Labels")
-        configure_dialog(self, width=920, height=640, min_width=840, min_height=560, resizable=True, parent=master)
+        configure_dialog(self, width=1040, height=640, min_width=960, min_height=560, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
         self.grab_set()
 
@@ -464,12 +503,12 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             header,
             text=(
-                "Label rows from bảng kê (Số S/O) where Tên NPL contains: "
-                "nhãn, label, poly, satin, picto…"
+                "Label rows from bảng kê (Số S/O). Cột «Tồn kho»: để Tự động thì check phiếu map theo rule; "
+                "chọn loại cụ thể để ghi đè (poly, satin, nhãn lạ…)."
             ),
             font=FONT_SMALL,
             text_color=COLORS["muted"],
-            wraplength=860,
+            wraplength=960,
             justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
@@ -524,14 +563,34 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
         self._load_rows()
         show_dialog(self, master)
 
+    def _init_stock_choices(self) -> None:
+        from core.npl_stock_service import NplStockService
+
+        self._stock_label_to_id = {self.AUTO_STOCK_LABEL: None}
+        self._stock_id_to_label = {}
+        labels = [self.AUTO_STOCK_LABEL]
+        for item in NplStockService(self.app_state.db).list_stock_type_choices():
+            type_id = int(item["id"])
+            unit = normalize_text(item.get("unit_label")) or "pcs"
+            label = f"{normalize_text(item.get('name'))} ({unit})"
+            if label in self._stock_label_to_id and self._stock_label_to_id[label] != type_id:
+                label = f"{label} #{type_id}"
+            self._stock_label_to_id[label] = type_id
+            self._stock_id_to_label[type_id] = label
+            labels.append(label)
+        self._stock_choice_labels = labels
+
     def _load_rows(self) -> None:
+        from core.npl_stock_service import suggest_stock_mapping_label
         from core.prepare_service import item_key, list_label_candidates
 
         for w in self.rows_frame.winfo_children():
             w.destroy()
         self.checkbox_vars.clear()
+        self.stock_map_vars.clear()
+        self._init_stock_choices()
 
-        bom_df = self.state.get_active_bom_ke_df()
+        bom_df = self.app_state.get_active_bom_ke_df()
         if bom_df is None or bom_df.empty:
             ctk.CTkLabel(
                 self.rows_frame,
@@ -553,14 +612,32 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
             self.summary_label.configure(text="0 candidates")
             return
 
-        saved = self.state.db.list_planning_prepare_items(self.entry_id)
-        saved_keys = {item_key(str(r.get("ma_npl")), int(r.get("row_index", 0))) for r in saved}
-        default_checked = bool(saved_keys)
+        saved = self.app_state.db.list_planning_prepare_items(self.entry_id)
+        saved_by_key = {
+            item_key(str(r.get("ma_npl")), int(r.get("row_index", 0))): r for r in saved
+        }
+        default_checked = bool(saved_by_key)
 
         for idx, row in enumerate(self.candidates):
             key = str(row["item_key"])
-            var = ctk.BooleanVar(value=key in saved_keys if default_checked else False)
+            var = ctk.BooleanVar(value=key in saved_by_key if default_checked else False)
             self.checkbox_vars[key] = var
+
+            saved_row = saved_by_key.get(key)
+            saved_type_id = saved_row.get("npl_stock_type_id") if saved_row else None
+            if saved_type_id:
+                default_stock_label = self._stock_id_to_label.get(int(saved_type_id), self.AUTO_STOCK_LABEL)
+            else:
+                default_stock_label = self.AUTO_STOCK_LABEL
+            stock_var = ctk.StringVar(value=default_stock_label)
+            self.stock_map_vars[key] = stock_var
+
+            auto_hint = suggest_stock_mapping_label(
+                self.app_state.db,
+                ma_npl=str(row.get("ma_npl", "")),
+                ten_npl=str(row.get("ten_npl", "")),
+                mo_ta=str(row.get("mo_ta", "")),
+            )
 
             bg = ("gray95", "gray26") if idx % 2 == 0 else ("gray90", "gray22")
             line = ctk.CTkFrame(self.rows_frame, fg_color=bg, corner_radius=6)
@@ -570,10 +647,10 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
             from core.prepare_service import format_prepare_quantity
 
             for text, width in [
-                (row.get("ma_npl", ""), 108),
-                (row.get("ten_npl", ""), 220),
-                (row.get("mo_ta", ""), 180),
-                (format_prepare_quantity(row.get("quantity")), 80),
+                (row.get("ma_npl", ""), 100),
+                (row.get("ten_npl", ""), 180),
+                (row.get("mo_ta", ""), 140),
+                (format_prepare_quantity(row.get("quantity")), 72),
             ]:
                 ctk.CTkLabel(
                     line,
@@ -581,9 +658,27 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
                     width=width,
                     anchor="w" if width > 100 else "center",
                     font=FONT_SMALL,
-                    wraplength=width - 8 if width >= 180 else 0,
+                    wraplength=width - 8 if width >= 140 else 0,
                     justify="left",
                 ).pack(side="left", padx=4, pady=8)
+
+            ctk.CTkLabel(
+                line,
+                text=auto_hint,
+                width=88,
+                anchor="w",
+                font=FONT_SMALL,
+                text_color=COLORS["muted"],
+            ).pack(side="left", padx=4, pady=8)
+
+            ctk.CTkOptionMenu(
+                line,
+                variable=stock_var,
+                values=self._stock_choice_labels,
+                width=144,
+                height=28,
+                font=FONT_SMALL,
+            ).pack(side="left", padx=(4, 8), pady=8)
 
         self.summary_label.configure(text=f"{len(self.candidates)} candidate(s)")
 
@@ -598,8 +693,17 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
     def _selected_items(self) -> list[dict]:
         selected: list[dict] = []
         for row in self.candidates:
-            if self.checkbox_vars.get(str(row["item_key"]), ctk.BooleanVar(value=False)).get():
-                selected.append(row)
+            key = str(row["item_key"])
+            if not self.checkbox_vars.get(key, ctk.BooleanVar(value=False)).get():
+                continue
+            item = dict(row)
+            stock_label = self.stock_map_vars.get(key, ctk.StringVar(value=self.AUTO_STOCK_LABEL)).get()
+            type_id = self._stock_label_to_id.get(stock_label)
+            if type_id:
+                item["npl_stock_type_id"] = type_id
+            else:
+                item.pop("npl_stock_type_id", None)
+            selected.append(item)
         return selected
 
     def _confirm(self) -> None:
@@ -610,12 +714,12 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
         if not selected:
             messagebox.showwarning("Prepare", "Chọn ít nhất một dòng nhãn.", parent=self)
             return
-        actor = self.state.user.display_name or self.state.user.username
-        self.state.db.save_planning_prepare_items(
+        actor = self.app_state.user.display_name or self.app_state.user.username
+        self.app_state.db.save_planning_prepare_items(
             self.entry_id,
             selected,
             prepare_by=actor,
-            actor_user_id=self.state.user.numeric_id(),
+            actor_user_id=self.app_state.user.numeric_id(),
         )
         messagebox.showinfo(
             "Prepare",
@@ -626,14 +730,227 @@ class PrepareLabelsDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class EditPlanDialog(ctk.CTkToplevel):
+    """Sửa plan chưa confirmed."""
+
+    def __init__(self, master, *, db, plan: dict, on_saved, actor: str = "", lookup_from_ol=None) -> None:
+        super().__init__(master)
+        self.db = db
+        self.plan = plan
+        self.entry_id = int(plan["id"])
+        self.on_saved = on_saved
+        self.actor = actor
+        self.lookup_from_ol = lookup_from_ol
+        self.title("Sửa plan")
+        configure_dialog(self, width=560, height=520, min_width=520, min_height=480, parent=master)
+        self.transient(master.winfo_toplevel())
+        self.grab_set()
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=20, pady=16)
+        ctk.CTkLabel(body, text="Sửa Production Plan", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+
+        self.vars = {
+            "dg_case": ctk.StringVar(value=str(plan.get("dg_case") or "")),
+            "item_code": ctk.StringVar(value=str(plan.get("item_code") or "")),
+            "supplier": ctk.StringVar(value=str(plan.get("supplier") or "")),
+            "quantity": ctk.StringVar(value=str(plan.get("quantity") or "")),
+            "plan_date": ctk.StringVar(value=str(plan.get("plan_date") or "")),
+            "verify_date": ctk.StringVar(value=str(plan.get("verify_date") or "")),
+            "session": ctk.StringVar(value=str(plan.get("session") or "—")),
+        }
+        fields = [
+            ("DG Case", "dg_case", ""),
+            ("Production No", "item_code", ""),
+            ("Supplier", "supplier", ""),
+            ("Quantity", "quantity", ""),
+            ("Hạn giao tem", "plan_date", "để trống nếu chưa biết"),
+            ("Ngày lập KH", "verify_date", "dd-mm-yyyy"),
+        ]
+        for label, key, placeholder in fields:
+            row = ctk.CTkFrame(body, fg_color="transparent")
+            row.pack(fill="x", pady=6)
+            ctk.CTkLabel(row, text=label, width=110, anchor="w", font=FONT_BODY).pack(side="left")
+            if key in PLAN_DATE_PICK_KEYS:
+                ctk.CTkEntry(
+                    row, textvariable=self.vars[key], height=34, state="readonly"
+                ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+                ctk.CTkButton(
+                    row,
+                    text="Pick",
+                    width=64,
+                    height=34,
+                    command=lambda k=key, lbl=label: self._pick_date(k, lbl),
+                ).pack(side="left", padx=(0, 4))
+                if key == "plan_date":
+                    ctk.CTkButton(
+                        row,
+                        text="Clear",
+                        width=64,
+                        height=34,
+                        fg_color="transparent",
+                        border_width=1,
+                        command=lambda k=key: self.vars[k].set(""),
+                    ).pack(side="left")
+            else:
+                ctk.CTkEntry(row, textvariable=self.vars[key], placeholder_text=placeholder, height=34).pack(
+                    side="left", fill="x", expand=True
+                )
+
+        srow = ctk.CTkFrame(body, fg_color="transparent")
+        srow.pack(fill="x", pady=6)
+        ctk.CTkLabel(srow, text="Session", width=110, anchor="w", font=FONT_BODY).pack(side="left")
+        ctk.CTkComboBox(
+            srow,
+            values=SESSION_OPTIONS,
+            variable=self.vars["session"],
+            state="readonly",
+            width=180,
+            height=34,
+        ).pack(side="left")
+
+        brow = ctk.CTkFrame(body, fg_color="transparent")
+        brow.pack(fill="x", pady=(16, 0))
+        ctk.CTkButton(
+            brow,
+            text="Lịch sử",
+            fg_color="transparent",
+            command=self._open_history,
+        ).pack(side="left")
+        ctk.CTkButton(brow, text="Hủy", fg_color="transparent", command=self.destroy).pack(side="right", padx=4)
+        ctk.CTkButton(
+            brow, text="Lưu", fg_color=COLORS["success"][1], command=self._save
+        ).pack(side="right")
+        show_dialog(self, master)
+
+    def _pick_date(self, key: str, label: str) -> None:
+        parsed = parse_date_dd_mm_yyyy(self.vars[key].get())
+        initial = parsed.date() if parsed is not None else None
+        DatePickerDialog(
+            self,
+            title=label,
+            initial=initial,
+            on_select=lambda value: self.vars[key].set(value),
+        )
+
+    def _open_history(self) -> None:
+        PlanHistoryDialog(self, db=self.db, entry_id=self.entry_id, plan=self.plan)
+
+    def _save(self) -> None:
+        try:
+            payload = validate_plan_payload(
+                dg_case=self.vars["dg_case"].get(),
+                item_code=self.vars["item_code"].get(),
+                supplier=self.vars["supplier"].get(),
+                quantity=self.vars["quantity"].get(),
+                plan_date=self.vars["plan_date"].get(),
+                verify_date=self.vars["verify_date"].get(),
+                session=self.vars["session"].get(),
+            )
+        except PlanningValidationError as exc:
+            messagebox.showwarning("Planning", str(exc), parent=self)
+            return
+        if not confirm_duplicate_plan(self, self.db, payload["dg_case"], exclude_id=self.entry_id):
+            return
+        actor = self.actor
+        try:
+            self.db.update_planning_entry(
+                self.entry_id,
+                dg_case=payload["dg_case"],
+                item_code=payload["item_code"],
+                supplier=payload["supplier"],
+                quantity=payload["quantity"],
+                plan_date=payload["plan_date"],
+                plan_date_iso=payload["plan_date_iso"],
+                verify_date=payload["verify_date"],
+                verify_date_iso=payload["verify_date_iso"],
+                session=payload["session"],
+                actor=actor,
+            )
+        except Exception as exc:
+            messagebox.showerror("Planning", str(exc), parent=self)
+            return
+        self.on_saved()
+        self.destroy()
+
+
+class PlanHistoryDialog(ctk.CTkToplevel):
+    """Lịch sử thay đổi một plan — truy xuất ngày lập KH và các lần sửa."""
+
+    def __init__(self, master, *, db, entry_id: int, plan: dict) -> None:
+        super().__init__(master)
+        self.db = db
+        self.entry_id = entry_id
+        self.plan = plan
+        self.title("Lịch sử plan")
+        configure_dialog(self, width=820, height=520, min_width=720, min_height=420, resizable=True, parent=master)
+        self.transient(master.winfo_toplevel())
+
+        _, header, content, footer = create_dialog_layout(self)
+        dg = normalize_text(plan.get("dg_case")) or "—"
+        ctk.CTkLabel(header, text=f"Lịch sử · {dg}", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ctk.CTkLabel(
+            header,
+            text=(
+                f"Hạn giao {plan.get('plan_date', '—')} · Ngày lập KH {plan.get('verify_date', '—')} · "
+                f"{plan.get('item_code', '')}"
+            ),
+            font=FONT_SMALL,
+            text_color=COLORS["muted"],
+            wraplength=760,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 8))
+
+        scroll = ctk.CTkScrollableFrame(content, fg_color=COLORS["card"], corner_radius=10)
+        scroll.grid(row=0, column=0, sticky="nsew")
+
+        entries = db.list_planning_entry_history(entry_id)
+        if not entries:
+            ctk.CTkLabel(
+                scroll,
+                text="Chưa có lịch sử ghi nhận.",
+                font=FONT_BODY,
+                text_color=COLORS["muted"],
+            ).pack(pady=24)
+        else:
+            for idx, entry in enumerate(entries):
+                self._row(scroll, entry, idx)
+
+        ctk.CTkButton(footer, text="Đóng", width=90, height=36, fg_color="transparent", command=self.destroy).pack(
+            side="right"
+        )
+        show_dialog(self, master)
+
+    def _row(self, parent, entry: dict, row_idx: int) -> None:
+        bg = ("gray95", "gray26") if row_idx % 2 == 0 else ("gray90", "gray22")
+        row = ctk.CTkFrame(parent, fg_color=bg, corner_radius=6)
+        row.pack(fill="x", padx=10, pady=4)
+
+        line = format_audit_log_line(entry)
+        for part in line.split("\n"):
+            ctk.CTkLabel(row, text=part.strip(), font=FONT_SMALL, anchor="w", justify="left").pack(
+                anchor="w", padx=10, pady=(4 if part == line.split("\n")[0] else 0, 2)
+            )
+        detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+        snap = detail.get("after") or detail.get("before") or {}
+        if snap and str(entry.get("action")) == "created":
+            ctk.CTkLabel(
+                row,
+                text=f"Snapshot: Giao {snap.get('plan_date', '—')} · Lập KH {snap.get('verify_date', '—')}",
+                font=FONT_SMALL,
+                text_color=COLORS["muted"],
+                anchor="w",
+            ).pack(anchor="w", padx=10, pady=(0, 6))
+
+
 class DayDetailDialog(ctk.CTkToplevel):
     TABLE_HEADERS = (
         ("DG Case", 100),
         ("Production No", 118),
         ("Supplier", 96),
         ("Qty", 48),
-        ("Plan Date", 88),
-        ("Verify Date", 88),
+        ("Hạn giao tem", 88),
+        ("Ngày lập KH", 88),
         ("Session", 68),
         ("Check", 92),
         ("Checked At", 132),
@@ -652,6 +969,8 @@ class DayDetailDialog(ctk.CTkToplevel):
         on_refresh,
         on_add_plan=None,
         can_write: bool = True,
+        actor: str = "",
+        lookup_from_ol=None,
     ):
         super().__init__(master)
         self.db = db
@@ -662,7 +981,11 @@ class DayDetailDialog(ctk.CTkToplevel):
         self.on_refresh = on_refresh
         self.on_add_plan = on_add_plan
         self._can_write = can_write
+        self.actor = actor
+        self.lookup_from_ol = lookup_from_ol
         self.selected_id: int | None = None
+        self._plans: list[dict] = []
+        self._pager = TablePager()
         self.title("Day Plan Details")
         configure_dialog(self, width=1180, height=600, min_width=1000, min_height=500, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
@@ -683,8 +1006,8 @@ class DayDetailDialog(ctk.CTkToplevel):
         btn_state = "normal" if self._can_write else "disabled"
         ctk.CTkButton(
             action_bar,
-            text="Confirm Delivery",
-            width=140,
+            text="Check phiếu (đã lưu)",
+            width=160,
             height=34,
             fg_color=COLORS["success"][1],
             command=self._confirm_selected,
@@ -697,6 +1020,21 @@ class DayDetailDialog(ctk.CTkToplevel):
             height=34,
             command=self._prepare_selected,
             state=btn_state,
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            action_bar,
+            text="Sửa plan",
+            width=100,
+            height=34,
+            command=self._edit_selected,
+            state=btn_state,
+        ).pack(side="left", padx=6)
+        ctk.CTkButton(
+            action_bar,
+            text="Lịch sử",
+            width=90,
+            height=34,
+            command=self._history_selected,
         ).pack(side="left", padx=6)
         ctk.CTkButton(
             action_bar,
@@ -717,7 +1055,7 @@ class DayDetailDialog(ctk.CTkToplevel):
 
         table_wrap = ctk.CTkFrame(content, fg_color=COLORS["card"], corner_radius=10)
         table_wrap.grid(row=0, column=0, sticky="nsew")
-        table_wrap.grid_rowconfigure(1, weight=1)
+        table_wrap.grid_rowconfigure(2, weight=1)
         table_wrap.grid_columnconfigure(0, weight=1)
 
         col_header = ctk.CTkFrame(table_wrap, fg_color=("gray88", "gray28"), corner_radius=0)
@@ -732,8 +1070,17 @@ class DayDetailDialog(ctk.CTkToplevel):
                 font=("Segoe UI", 11, "bold"),
             ).grid(row=0, column=i, sticky="nsew", padx=4, pady=8)
 
+        self._pager_bar = TablePagerBar(
+            table_wrap,
+            self._pager,
+            on_change=self._render_plan_page,
+            placeholder="Lọc DG, SP, NCC…",
+        )
+        self._pager_bar.set_filter_handler(self._plan_quick_filter)
+        self._pager_bar.grid(row=1, column=0, sticky="ew", padx=12, pady=(6, 0))
+
         self.rows_frame = ctk.CTkScrollableFrame(table_wrap, fg_color="transparent")
-        self.rows_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.rows_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
         ctk.CTkButton(footer, text="Close", width=90, height=36, fg_color="transparent", command=self._close).pack(
             anchor="center"
@@ -744,19 +1091,36 @@ class DayDetailDialog(ctk.CTkToplevel):
     def _close(self) -> None:
         self.destroy()
 
+    @staticmethod
+    def _plan_quick_filter(plan: dict, query: str) -> bool:
+        blob = " ".join(
+            [
+                normalize_text(plan.get("dg_case")),
+                normalize_text(plan.get("item_code")),
+                normalize_text(plan.get("supplier")),
+                normalize_text(plan.get("session")),
+                str(plan.get("quantity") or ""),
+            ]
+        ).lower()
+        return query in blob
+
     def _reload_rows(self) -> None:
         iso = self.day.strftime("%Y-%m-%d")
-        plans = self.db.list_planning_entries_for_day(iso)
-        miss_n = sum(1 for p in plans if effective_check_status(p) == "miss")
-        confirmed_n = sum(1 for p in plans if effective_check_status(p) == "confirmed")
+        self._plans = self.db.list_planning_entries_for_day(iso)
+        miss_n = sum(1 for p in self._plans if effective_check_status(p) == "miss")
+        confirmed_n = sum(1 for p in self._plans if effective_check_status(p) == "confirmed")
         self.subtitle.configure(
-            text=f"{len(plans)} item(s) · {confirmed_n} confirmed · {miss_n} miss"
+            text=f"{len(self._plans)} item(s) · {confirmed_n} confirmed · {miss_n} miss"
         )
+        self._pager.set_items(self._plans, filter_fn=self._plan_quick_filter, reset_page=False)
+        self._render_plan_page()
 
+    def _render_plan_page(self) -> None:
         for w in self.rows_frame.winfo_children():
             w.destroy()
-
-        if not plans:
+        page_items = self._pager.page_items()
+        self._pager_bar.refresh_info()
+        if not page_items and not self._plans:
             empty = ctk.CTkFrame(self.rows_frame, fg_color="transparent")
             empty.pack(pady=24, padx=12, anchor="center")
             ctk.CTkLabel(
@@ -773,9 +1137,45 @@ class DayDetailDialog(ctk.CTkToplevel):
                     command=self._add_plan,
                 ).pack()
             return
+        if not page_items:
+            ctk.CTkLabel(
+                self.rows_frame,
+                text="Không có plan khớp bộ lọc.",
+                font=FONT_BODY,
+                text_color=COLORS["muted"],
+            ).pack(pady=20)
+            return
 
-        for idx, plan in enumerate(plans):
+        for idx, plan in enumerate(page_items):
             self._render_row(plan, idx)
+
+    def _edit_selected(self) -> None:
+        if self.selected_id is None:
+            messagebox.showinfo("Day Plans", "Chọn một dòng trước.", parent=self)
+            return
+        plan = next((p for p in self._plans if int(p["id"]) == self.selected_id), None)
+        if not plan:
+            return
+        if effective_check_status(plan) == "confirmed":
+            messagebox.showinfo("Day Plans", "Plan đã lưu — không sửa được.", parent=self)
+            return
+        EditPlanDialog(
+            self,
+            db=self.db,
+            plan=plan,
+            actor=self.actor,
+            lookup_from_ol=self.lookup_from_ol,
+            on_saved=lambda: (self._reload_rows(), self.on_refresh()),
+        )
+
+    def _history_selected(self) -> None:
+        if self.selected_id is None:
+            messagebox.showinfo("Day Plans", "Chọn một dòng trước.", parent=self)
+            return
+        plan = next((p for p in self._plans if int(p["id"]) == self.selected_id), None)
+        if not plan:
+            return
+        PlanHistoryDialog(self, db=self.db, entry_id=int(plan["id"]), plan=plan)
 
     def _select_row(self, entry_id: int) -> None:
         self.selected_id = entry_id
@@ -802,6 +1202,8 @@ class DayDetailDialog(ctk.CTkToplevel):
                 return COLORS["success"][1]
             if status == "miss":
                 return "#ef5350"
+            if status == "no_date":
+                return COLORS["accent"][1]
             return COLORS["warning"][1]
         if status == "prepared":
             return COLORS["success"][1]
@@ -832,7 +1234,7 @@ class DayDetailDialog(ctk.CTkToplevel):
             normalize_text(plan.get("item_code")),
             normalize_text(plan.get("supplier")) or "—",
             str(plan.get("quantity", "")),
-            normalize_text(plan.get("plan_date")),
+            normalize_text(plan.get("plan_date")) or "—",
             normalize_text(plan.get("verify_date")),
             session,
             format_check_display(plan),
@@ -866,7 +1268,14 @@ class DayDetailDialog(ctk.CTkToplevel):
             messagebox.showwarning("Day Plans", "Plan not found.", parent=self)
             return
         if effective_check_status(plan) == "confirmed":
-            messagebox.showinfo("Day Plans", "Delivery already confirmed for this row.", parent=self)
+            messagebox.showinfo("Day Plans", "Tem đã lưu (đã check phiếu).", parent=self)
+            return
+        if plan_needs_delivery_date(plan):
+            messagebox.showwarning(
+                "Day Plans",
+                "Plan chưa có hạn giao tem.\n\nSửa plan và nhập hạn giao trước khi check phiếu.",
+                parent=self,
+            )
             return
         self.on_confirm(self.selected_id)
         self.on_refresh()
@@ -920,6 +1329,7 @@ class PlanningPanel(ctk.CTkFrame):
         self.view_month = today.month
         self.selected_day: date | None = None
         self._plans_by_day: dict[str, list[dict]] = {}
+        self._day_cells: dict[date, ctk.CTkFrame] = {}
         self._click_timer: str | None = None
         self._build()
         self._reload_calendar()
@@ -1075,20 +1485,30 @@ class PlanningPanel(ctk.CTkFrame):
         today_iso = iso_today()
         self.state.db.sync_planning_miss_flags(today_iso)
         entries = self.state.db.list_planning_entries_for_month(self.view_year, self.view_month)
+        needs_date = self.state.db.list_planning_needs_delivery_date()
         self._plans_by_day = {}
         for entry in entries:
             iso = str(entry.get("plan_date_iso", ""))
+            if not iso:
+                continue
             self._plans_by_day.setdefault(iso, []).append(entry)
 
         confirmed = sum(1 for e in entries if effective_check_status(e, today_iso=today_iso) == "confirmed")
         miss_n = sum(1 for e in entries if effective_check_status(e, today_iso=today_iso) == "miss")
         open_n = len(entries) - confirmed - miss_n
-        self.summary_label.configure(
-            text=f"{len(entries)} plan(s) · {confirmed} confirmed · {miss_n} miss · {open_n} open"
-        )
+        needs_n = len(needs_date)
+        summary = f"{len(entries)} plan(s) · {confirmed} confirmed · {miss_n} miss · {open_n} open"
+        if needs_n:
+            summary += f" · {needs_n} chưa có hạn giao"
+        self.summary_label.configure(text=summary)
+        if needs_n:
+            self.summary_label.configure(text_color=COLORS["accent"][1])
+        else:
+            self.summary_label.configure(text_color=COLORS["muted"])
 
         for child in self.calendar_grid.winfo_children():
             child.destroy()
+        self._day_cells.clear()
 
         weeks = calendar.monthcalendar(self.view_year, self.view_month)
 
@@ -1131,11 +1551,35 @@ class PlanningPanel(ctk.CTkFrame):
                     font=("Segoe UI", 15, "bold"),
                     text_color=num_color,
                 ).pack()
+                self._day_cells[day] = cell
                 self._bind_day_cell(cell, day)
 
+    def _update_day_selection(self, old_day: date | None, new_day: date | None) -> None:
+        today_iso = iso_today()
+        for d in {old_day, new_day}:
+            if d is None:
+                continue
+            cell = self._day_cells.get(d)
+            if cell is None:
+                continue
+            try:
+                if not cell.winfo_exists():
+                    continue
+            except Exception:
+                continue
+            iso = d.strftime("%Y-%m-%d")
+            plans = self._plans_by_day.get(iso, [])
+            is_today = iso == today_iso
+            is_selected = self.selected_day == d
+            bg = self._day_bg(plans, today_iso=today_iso)
+            border_w = 2 if is_selected or is_today else 0
+            border_color = CAL_SELECTED_BORDER if is_selected else (CAL_TODAY if is_today else bg[1])
+            cell.configure(border_width=border_w, border_color=border_color)
+
     def _select_day(self, day: date) -> None:
+        old = self.selected_day
         self.selected_day = day
-        self._reload_calendar()
+        self._update_day_selection(old, day)
 
     def _open_day_detail(self, day: date) -> None:
         self.selected_day = day
@@ -1149,6 +1593,8 @@ class PlanningPanel(ctk.CTkFrame):
             on_refresh=self._reload_calendar,
             on_add_plan=lambda d=day: self._open_add_plan_for_day(d),
             can_write=self._can_write,
+            actor=self.state.user.display_name or self.state.user.username,
+            lookup_from_ol=self._lookup_from_ol,
         )
         self._reload_calendar()
 
@@ -1173,7 +1619,7 @@ class PlanningPanel(ctk.CTkFrame):
     def _initial_plan_date(self) -> str:
         if self.selected_day:
             return format_date_dd_mm_yyyy(self.selected_day)
-        return format_date_dd_mm_yyyy(date.today())
+        return ""
 
     def _open_add_plan(self) -> None:
         AddPlanDialog(
@@ -1203,16 +1649,46 @@ class PlanningPanel(ctk.CTkFrame):
     def _save_plans_batch(self, plans: list[dict]) -> None:
         if not self._require_write():
             return
+        added = 0
+        skipped = 0
         for payload in plans:
-            self._insert_plan(payload, refresh=False)
+            if self._insert_plan(payload, refresh=False, parent=self):
+                added += 1
+            else:
+                skipped += 1
         self._reload_calendar()
+        if skipped:
+            messagebox.showinfo(
+                "Import Excel",
+                f"Đã thêm {added} plan. Bỏ qua {skipped} plan trùng DG Case.",
+                parent=self,
+            )
 
-    def _insert_plan(self, payload: dict, *, refresh: bool = True) -> None:
+    def _insert_plan(self, payload: dict, *, refresh: bool = True, parent=None) -> bool:
+        if parent is not None:
+            if not confirm_duplicate_plan(parent, self.state.db, payload["dg_case"]):
+                return False
+        from core.ol_reader import OlReaderService
+        from core.utils import extract_customer_code_from_product_code
+
         actor = self.state.user.display_name or self.state.user.username
+        customer_code = ""
+        ol_df = self.state.get_active_ol_df()
+        item_code = str(payload["item_code"])
+        if ol_df is not None and not ol_df.empty:
+            ol = OlReaderService(self.state.db).lookup_fields_for_dg_case(
+                ol_df, str(payload["dg_case"])
+            )
+            customer_code = extract_customer_code_from_product_code(
+                ol.get("item_code") or item_code
+            )
+        if not customer_code:
+            customer_code = extract_customer_code_from_product_code(item_code)
         self.state.db.add_planning_entry(
             dg_case=str(payload["dg_case"]),
-            item_code=str(payload["item_code"]),
+            item_code=item_code,
             supplier=str(payload.get("supplier", "")),
+            customer_code=customer_code,
             quantity=float(payload["quantity"]),
             plan_date=str(payload["plan_date"]),
             plan_date_iso=str(payload["plan_date_iso"]),
@@ -1223,24 +1699,62 @@ class PlanningPanel(ctk.CTkFrame):
             actor=actor,
         )
         iso = str(payload["plan_date_iso"])
-        parts = iso.split("-")
-        if len(parts) == 3:
-            self.view_year = int(parts[0])
-            self.view_month = int(parts[1])
-            self.selected_day = date(int(parts[0]), int(parts[1]), int(parts[2]))
+        if iso:
+            parts = iso.split("-")
+            if len(parts) == 3:
+                self.view_year = int(parts[0])
+                self.view_month = int(parts[1])
+                self.selected_day = date(int(parts[0]), int(parts[1]), int(parts[2]))
         if refresh:
             self._reload_calendar()
+        return True
 
     def _open_check_plan(self) -> None:
         entries = self.state.db.list_planning_entries_for_month(self.view_year, self.view_month)
-        CheckPlanDialog(self, entries=entries, on_verify=self._verify_entry)
+        needs_date = self.state.db.list_planning_needs_delivery_date()
+        CheckPlanDialog(
+            self,
+            entries=entries,
+            needs_date=needs_date,
+            on_verify=self._verify_entry,
+            on_edit_plan=self._edit_unscheduled_plan,
+            can_write=self._can_write,
+        )
 
     def _open_reminders(self) -> None:
+        needs_date = self.state.db.list_planning_needs_delivery_date()
         reminders = self.state.db.list_planning_reminders(
             from_iso=iso_today(),
             to_iso=iso_in_days(7),
         )
-        RemindersDialog(self, reminders=reminders, on_verify=self._verify_entry)
+        RemindersDialog(
+            self,
+            needs_date=needs_date,
+            reminders=reminders,
+            on_verify=self._verify_entry,
+            on_edit_plan=self._edit_unscheduled_plan,
+            can_write=self._can_write,
+        )
+
+    def _edit_unscheduled_plan(self, entry_id: int, on_done=None) -> None:
+        if not self._require_write():
+            return
+        plan = self.state.db.get_planning_entry(entry_id)
+        if not plan:
+            return
+        EditPlanDialog(
+            self,
+            db=self.state.db,
+            plan=plan,
+            actor=self.state.user.display_name or self.state.user.username,
+            lookup_from_ol=self._lookup_from_ol,
+            on_saved=lambda: self._edit_unscheduled_plan_saved(on_done),
+        )
+
+    def _edit_unscheduled_plan_saved(self, on_done=None) -> None:
+        self._reload_calendar()
+        if on_done:
+            on_done()
 
     def _open_planning_log(self) -> None:
         entries = self.state.db.list_planning_audit_log(
@@ -1254,16 +1768,23 @@ class PlanningPanel(ctk.CTkFrame):
             month_title=self._month_title(),
         )
 
-    def _confirm_delivery(self, entry_id: int) -> None:
+    def _confirm_delivery(self, entry_id: int) -> bool:
         if not self._require_write():
-            return
+            return False
         actor = self.state.user.display_name or self.state.user.username
-        self.state.db.update_planning_check_status(
+        ok, msg = supplier_db.mark_plan_saved(
+            self.state.db,
             entry_id,
-            "confirmed",
-            check_by=actor,
+            actor=actor,
             actor_user_id=self.state.user.numeric_id(),
         )
+        if ok:
+            messagebox.showinfo("Planning", msg, parent=self)
+            self._reload_calendar()
+            self.state.notify()
+            return True
+        messagebox.showwarning("Planning", msg, parent=self)
+        return False
 
     def _prepare_entry(self, entry_id: int, on_done=None) -> None:
         plan = self.state.db.get_planning_entry(entry_id)
@@ -1296,16 +1817,29 @@ class PlanningPanel(ctk.CTkFrame):
         else:
             messagebox.showwarning("Planning", "Could not remove plan.")
 
-    def _verify_entry(self, entry_id: int) -> None:
-        self._confirm_delivery(entry_id)
+    def _verify_entry(self, entry_id: int) -> bool:
+        return self._confirm_delivery(entry_id)
         self._reload_calendar()
 
 
 class CheckPlanDialog(ctk.CTkToplevel):
-    def __init__(self, master, *, entries: list[dict], on_verify):
+    def __init__(
+        self,
+        master,
+        *,
+        entries: list[dict],
+        needs_date: list[dict] | None = None,
+        on_verify,
+        on_edit_plan=None,
+        can_write: bool = True,
+    ):
         super().__init__(master)
         self.on_verify = on_verify
+        self.on_edit_plan = on_edit_plan
+        self.can_write = can_write
+        self.needs_date = needs_date or []
         self.entries = entries
+        self._pager = TablePager()
         self.title("Check Plan")
         configure_dialog(self, width=820, height=580, min_width=720, min_height=480, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
@@ -1316,7 +1850,7 @@ class CheckPlanDialog(ctk.CTkToplevel):
             header,
             text=(
                 "Review every plan scheduled in the current calendar month. "
-                "Use this to confirm delivery checks or spot misses (red / overdue items)."
+                "Đánh dấu «Đã lưu» = check phiếu Supplier (cùng một ý nghĩa)."
             ),
             font=FONT_SMALL,
             text_color=COLORS["muted"],
@@ -1333,24 +1867,101 @@ class CheckPlanDialog(ctk.CTkToplevel):
         )
         ctk.CTkLabel(
             header,
-            text=f"{len(entries)} total · {len(pending)} pending · {overdue_count} overdue",
+            text=(
+                f"{len(entries)} trong tháng · {len(pending)} pending · {overdue_count} overdue · "
+                f"{len(self.needs_date)} chưa có hạn giao"
+            ),
             font=FONT_SMALL,
             text_color=COLORS["muted"],
         ).pack(anchor="w", pady=(4, 8))
 
-        scroll = ctk.CTkScrollableFrame(content, fg_color=COLORS["card"], corner_radius=10)
-        scroll.grid(row=0, column=0, sticky="nsew")
+        content.grid_rowconfigure(2, weight=1)
+        if self.needs_date:
+            needs_box = ctk.CTkFrame(content, fg_color=COLORS["card"], corner_radius=10)
+            needs_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+            ctk.CTkLabel(
+                needs_box,
+                text="Chưa có hạn giao tem — cần cập nhật trước khi check phiếu",
+                font=("Segoe UI", 12, "bold"),
+                text_color=COLORS["accent"][1],
+            ).pack(anchor="w", padx=12, pady=(10, 6))
+            for entry in self.needs_date:
+                self._needs_date_row(needs_box, entry)
 
-        if not entries:
-            ctk.CTkLabel(scroll, text="No plans for this month.", font=FONT_BODY).pack(pady=20)
-        else:
-            for entry in entries:
-                self._row(scroll, entry)
+        self._pager_bar = TablePagerBar(
+            content,
+            self._pager,
+            on_change=self._render_check_page,
+            placeholder="Lọc plan tháng này…",
+        )
+        self._pager_bar.set_filter_handler(self._check_plan_filter)
+        self._pager_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+
+        self.scroll = ctk.CTkScrollableFrame(content, fg_color=COLORS["card"], corner_radius=10)
+        self.scroll.grid(row=2, column=0, sticky="nsew")
+
+        self._pager.set_items(entries, filter_fn=self._check_plan_filter, reset_page=True)
+        self._render_check_page()
 
         ctk.CTkButton(footer, text="Close", width=90, height=36, fg_color="transparent", command=self.destroy).pack(
             side="right"
         )
         show_dialog(self, master)
+
+    def _needs_date_row(self, parent, entry: dict) -> None:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=4)
+        text = (
+            f"{entry.get('dg_case')} · {entry.get('item_code')} · {entry.get('supplier', '')} · "
+            f"Qty {entry.get('quantity')} · Lập KH {entry.get('verify_date')}"
+        )
+        ctk.CTkLabel(row, text=text, font=FONT_SMALL, text_color=COLORS["accent"][1], anchor="w").pack(
+            side="left", fill="x", expand=True
+        )
+        if self.on_edit_plan is not None and self.can_write:
+            ctk.CTkButton(
+                row,
+                text="Nhập hạn giao",
+                width=110,
+                height=28,
+                command=lambda eid=int(entry["id"]): self._edit_plan(eid),
+            ).pack(side="right")
+
+    def _edit_plan(self, entry_id: int) -> None:
+        if self.on_edit_plan is None:
+            return
+
+        def refresh() -> None:
+            self.destroy()
+
+        self.on_edit_plan(entry_id, refresh)
+
+    @staticmethod
+    def _check_plan_filter(entry: dict, query: str) -> bool:
+        blob = " ".join(
+            [
+                normalize_text(entry.get("plan_date")),
+                normalize_text(entry.get("dg_case")),
+                normalize_text(entry.get("item_code")),
+                normalize_text(entry.get("supplier")),
+                str(entry.get("quantity") or ""),
+            ]
+        ).lower()
+        return query in blob
+
+    def _render_check_page(self) -> None:
+        for w in self.scroll.winfo_children():
+            w.destroy()
+        page_items = self._pager.page_items()
+        self._pager_bar.refresh_info()
+        if not page_items and not self.entries:
+            ctk.CTkLabel(self.scroll, text="No plans for this month.", font=FONT_BODY).pack(pady=20)
+            return
+        if not page_items:
+            ctk.CTkLabel(self.scroll, text="Không khớp bộ lọc.", font=FONT_BODY).pack(pady=20)
+            return
+        for entry in page_items:
+            self._row(self.scroll, entry)
 
     def _row(self, parent, entry: dict) -> None:
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1360,31 +1971,34 @@ class CheckPlanDialog(ctk.CTkToplevel):
         color = COLORS["warning"][1] if overdue else COLORS["muted"]
         prepare = prepare_status_label(effective_prepare_status(entry))
         text = (
-            f"{entry.get('plan_date')} · {entry.get('dg_case')} · {entry.get('item_code')} · "
-            f"{entry.get('supplier', '')} · Qty {entry.get('quantity')} · Verify {entry.get('verify_date')} · "
+            f"Giao {format_plan_date_display(entry)} · {entry.get('dg_case')} · {entry.get('item_code')} · "
+            f"{entry.get('supplier', '')} · Qty {entry.get('quantity')} · Lập KH {entry.get('verify_date')} · "
             f"Check {check_status_label(status)} · Prepare {prepare}"
         )
         ctk.CTkLabel(row, text=text, font=FONT_SMALL, text_color=color, anchor="w").pack(
             side="left", fill="x", expand=True
         )
         if status != "confirmed":
+            btn_state = "normal" if status != "no_date" else "disabled"
             ctk.CTkButton(
                 row,
-                text="Confirm",
-                width=70,
+                text="Check phiếu",
+                width=88,
                 height=28,
+                state=btn_state,
                 command=lambda eid=int(entry["id"]): self._verify(eid),
             ).pack(side="right")
 
     def _verify(self, entry_id: int) -> None:
-        self.on_verify(entry_id)
-        messagebox.showinfo("Check Plan", "Delivery confirmed.", parent=self)
-        self.destroy()
+        if self.on_verify(entry_id):
+            self.destroy()
 
 
 class PlanningLogDialog(ctk.CTkToplevel):
     def __init__(self, master, *, entries: list[dict], month_title: str):
         super().__init__(master)
+        self.entries = entries
+        self._pager = TablePager()
         self.title("Planning Log")
         configure_dialog(self, width=1000, height=600, min_width=820, min_height=480, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
@@ -1411,7 +2025,8 @@ class PlanningLogDialog(ctk.CTkToplevel):
             ("DG Case", 96),
             ("Production No", 110),
             ("Supplier", 96),
-            ("Plan Date", 88),
+            ("Hạn giao tem", 88),
+            ("Ngày lập KH", 88),
             ("By", 88),
         ]:
             ctk.CTkLabel(
@@ -1422,22 +2037,57 @@ class PlanningLogDialog(ctk.CTkToplevel):
                 font=("Segoe UI", 11, "bold"),
             ).pack(side="left", padx=4, pady=8)
 
-        scroll = ctk.CTkScrollableFrame(content, fg_color=COLORS["card"], corner_radius=10)
-        scroll.grid(row=0, column=0, sticky="nsew")
+        content.grid_rowconfigure(1, weight=1)
+        self._pager_bar = TablePagerBar(
+            content,
+            self._pager,
+            on_change=self._render_log_page,
+            placeholder="Lọc log tháng…",
+        )
+        self._pager_bar.set_filter_handler(self._log_filter)
+        self._pager_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
-        if not entries:
+        self.scroll = ctk.CTkScrollableFrame(content, fg_color=COLORS["card"], corner_radius=10)
+        self.scroll.grid(row=1, column=0, sticky="nsew")
+
+        self._pager.set_items(entries, filter_fn=self._log_filter, reset_page=True)
+        self._render_log_page()
+
+        ctk.CTkButton(footer, text="Close", width=90, height=36, command=self.destroy).pack(side="right")
+        show_dialog(self, master)
+
+    @staticmethod
+    def _log_filter(entry: dict, query: str) -> bool:
+        blob = " ".join(
+            [
+                normalize_text(entry.get("action")),
+                normalize_text(entry.get("dg_case")),
+                normalize_text(entry.get("item_code")),
+                normalize_text(entry.get("supplier")),
+                normalize_text(entry.get("actor")),
+                normalize_text(entry.get("plan_date")),
+            ]
+        ).lower()
+        return query in blob
+
+    def _render_log_page(self) -> None:
+        for w in self.scroll.winfo_children():
+            w.destroy()
+        page_items = self._pager.page_items()
+        self._pager_bar.refresh_info()
+        if not page_items and not self.entries:
             ctk.CTkLabel(
-                scroll,
+                self.scroll,
                 text="No activity recorded for this month.",
                 font=FONT_BODY,
                 text_color=COLORS["muted"],
             ).pack(pady=24)
-        else:
-            for idx, entry in enumerate(entries):
-                self._row(scroll, entry, idx)
-
-        ctk.CTkButton(footer, text="Close", width=90, height=36, command=self.destroy).pack(side="right")
-        show_dialog(self, master)
+            return
+        if not page_items:
+            ctk.CTkLabel(self.scroll, text="Không khớp bộ lọc.", font=FONT_BODY).pack(pady=24)
+            return
+        for idx, entry in enumerate(page_items):
+            self._row(self.scroll, entry, idx)
 
     def _row(self, parent, entry: dict, row_idx: int) -> None:
         action = str(entry.get("action", ""))
@@ -1454,14 +2104,15 @@ class PlanningLogDialog(ctk.CTkToplevel):
         item = normalize_text(entry.get("item_code")) or "—"
         supplier = normalize_text(entry.get("supplier")) or "—"
         plan_date = normalize_text(entry.get("plan_date")) or "—"
+        verify_date = normalize_text(entry.get("verify_date")) or "—"
         actor = normalize_text(entry.get("actor")) or "—"
         if is_delete:
             deleted_at = format_check_timestamp(entry.get("deleted_at"))
             if deleted_at:
                 when = deleted_at
 
-        values = [when, action_label, dg, item, supplier, plan_date, actor]
-        widths = [140, 120, 96, 110, 96, 88, 88]
+        values = [when, action_label, dg, item, supplier, plan_date, verify_date, actor]
+        widths = [140, 120, 96, 110, 96, 88, 88, 88]
         for text, width in zip(values, widths):
             color = "#c62828" if is_delete else None
             kwargs: dict = {
@@ -1473,74 +2124,141 @@ class PlanningLogDialog(ctk.CTkToplevel):
             if color:
                 kwargs["text_color"] = color
             ctk.CTkLabel(row, **kwargs).pack(side="left", padx=4, pady=6)
+        detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+        change = format_plan_change_line(detail)
+        if change:
+            ctk.CTkLabel(
+                parent,
+                text=f"    {change}",
+                font=FONT_SMALL,
+                text_color=COLORS["muted"],
+                anchor="w",
+            ).pack(fill="x", padx=16, pady=(0, 4))
 
 
 class RemindersDialog(ctk.CTkToplevel):
-    def __init__(self, master, *, reminders: list[dict], on_verify):
+    def __init__(
+        self,
+        master,
+        *,
+        needs_date: list[dict],
+        reminders: list[dict],
+        on_verify,
+        on_edit_plan=None,
+        can_write: bool = True,
+    ):
         super().__init__(master)
         self.on_verify = on_verify
+        self.on_edit_plan = on_edit_plan
+        self.can_write = can_write
+        self.needs_date = needs_date
+        self.reminders = reminders
         self.title("Reminders")
-        configure_dialog(self, width=780, height=520, min_width=680, min_height=420, resizable=True, parent=master)
+        configure_dialog(self, width=820, height=620, min_width=720, min_height=480, resizable=True, parent=master)
         self.transient(master.winfo_toplevel())
 
         _, header, content, footer = create_dialog_layout(self)
-        ctk.CTkLabel(header, text="Reminders — Next 7 Days", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ctk.CTkLabel(header, text="Nhắc việc Planning", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ctk.CTkLabel(
             header,
             text=(
-                "Shows plans whose Verify Date falls within the next 7 days and are not yet confirmed. "
-                "Use this as a short-term to-do list before items become Miss."
+                "Plan chưa có hạn giao sẽ luôn hiện ở đây cho đến khi nhập ngày giao và check phiếu. "
+                "Phần dưới là hạn giao trong 7 ngày tới."
             ),
             font=FONT_SMALL,
             text_color=COLORS["muted"],
-            wraplength=720,
+            wraplength=760,
             justify="left",
-        ).pack(anchor="w", pady=(4, 4))
-        ctk.CTkLabel(
-            header,
-            text="Tip: Check Plan = full month audit · Reminders = near-term deadlines only.",
-            font=FONT_SMALL,
-            text_color=COLORS["accent"][1],
-            wraplength=720,
-            justify="left",
-        ).pack(anchor="w", pady=(0, 8))
+        ).pack(anchor="w", pady=(4, 8))
 
+        content.grid_rowconfigure(0, weight=1)
         scroll = ctk.CTkScrollableFrame(content, fg_color=COLORS["card"], corner_radius=10)
         scroll.grid(row=0, column=0, sticky="nsew")
 
-        if not reminders:
+        if self.needs_date:
             ctk.CTkLabel(
                 scroll,
-                text="No upcoming verification reminders.",
+                text=f"Chưa có hạn giao tem ({len(self.needs_date)})",
+                font=("Segoe UI", 13, "bold"),
+                text_color=COLORS["accent"][1],
+            ).pack(anchor="w", padx=12, pady=(12, 6))
+            for entry in self.needs_date:
+                self._needs_date_row(scroll, entry)
+        else:
+            ctk.CTkLabel(
+                scroll,
+                text="Không có plan thiếu hạn giao tem.",
                 font=FONT_BODY,
                 text_color=COLORS["success"][1],
-            ).pack(pady=24)
+            ).pack(anchor="w", padx=12, pady=(12, 8))
+
+        ctk.CTkLabel(
+            scroll,
+            text=f"Hạn giao trong 7 ngày tới ({len(self.reminders)})",
+            font=("Segoe UI", 13, "bold"),
+        ).pack(anchor="w", padx=12, pady=(16, 6))
+
+        if not self.reminders:
+            ctk.CTkLabel(
+                scroll,
+                text="Không có plan sắp đến hạn giao tem.",
+                font=FONT_BODY,
+                text_color=COLORS["muted"],
+            ).pack(anchor="w", padx=12, pady=(0, 12))
         else:
-            for entry in reminders:
-                row = ctk.CTkFrame(scroll, fg_color="transparent")
-                row.pack(fill="x", padx=10, pady=6)
-                due = str(entry.get("verify_date", ""))
-                text = (
-                    f"Verify by {due} · {entry.get('dg_case')} · {entry.get('item_code')} · "
-                    f"{entry.get('supplier', '')} · Plan {entry.get('plan_date')} · Qty {entry.get('quantity')}"
-                )
-                ctk.CTkLabel(row, text=text, font=FONT_SMALL, anchor="w").pack(
-                    side="left", fill="x", expand=True
-                )
-                ctk.CTkButton(
-                    row,
-                    text="Confirm",
-                    width=70,
-                    height=28,
-                    command=lambda eid=int(entry["id"]): self._verify(eid),
-                ).pack(side="right")
+            for entry in self.reminders:
+                self._reminder_row(scroll, entry)
 
         ctk.CTkButton(footer, text="Close", width=90, height=36, fg_color="transparent", command=self.destroy).pack(
             side="right"
         )
         show_dialog(self, master)
 
+    def _needs_date_row(self, parent, entry: dict) -> None:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=6)
+        text = (
+            f"{entry.get('dg_case')} · {entry.get('item_code')} · {entry.get('supplier', '')} · "
+            f"Lập KH {entry.get('verify_date')} · Qty {entry.get('quantity')}"
+        )
+        ctk.CTkLabel(row, text=text, font=FONT_SMALL, text_color=COLORS["accent"][1], anchor="w").pack(
+            side="left", fill="x", expand=True
+        )
+        if self.on_edit_plan is not None and self.can_write:
+            ctk.CTkButton(
+                row,
+                text="Nhập hạn giao",
+                width=110,
+                height=28,
+                command=lambda eid=int(entry["id"]): self._edit_plan(eid),
+            ).pack(side="right")
+
+    def _reminder_row(self, parent, entry: dict) -> None:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=6)
+        due = format_plan_date_display(entry)
+        text = (
+            f"Giao tem {due} · {entry.get('dg_case')} · {entry.get('item_code')} · "
+            f"{entry.get('supplier', '')} · Lập KH {entry.get('verify_date')} · Qty {entry.get('quantity')}"
+        )
+        ctk.CTkLabel(row, text=text, font=FONT_SMALL, anchor="w").pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            row,
+            text="Check phiếu",
+            width=88,
+            height=28,
+            command=lambda eid=int(entry["id"]): self._verify(eid),
+        ).pack(side="right")
+
+    def _edit_plan(self, entry_id: int) -> None:
+        if self.on_edit_plan is None:
+            return
+
+        def refresh() -> None:
+            self.destroy()
+
+        self.on_edit_plan(entry_id, refresh)
+
     def _verify(self, entry_id: int) -> None:
-        self.on_verify(entry_id)
-        messagebox.showinfo("Reminders", "Delivery confirmed.", parent=self)
-        self.destroy()
+        if self.on_verify(entry_id):
+            self.destroy()

@@ -11,7 +11,7 @@ from core.app_state import AppState, SessionUser
 from core.auth import AuthService
 from core.user_db import create_user_database
 from core.supabase_config import supabase_enabled
-from ui.theme import APPEARANCE, COLOR_THEME, COLORS, FONT_BODY, FONT_SMALL, FONT_TITLE
+from ui.theme import APP_NAME, APP_VERSION, APPEARANCE, COLOR_THEME, COLORS, FONT_BODY, FONT_TITLE
 
 
 class LoginWindow(ctk.CTk):
@@ -25,8 +25,9 @@ class LoginWindow(ctk.CTk):
         self.db = None  # legacy count only
         self._mode = "login"
 
-        self.title("DG Hub — Đăng nhập")
-        self.geometry("420x480")
+        self.title(f"{APP_NAME} — Đăng nhập")
+        self.geometry("420x500")
+        self.minsize(420, 500)
         self.resizable(False, False)
 
         self.frame = ctk.CTkFrame(self, corner_radius=12)
@@ -38,25 +39,17 @@ class LoginWindow(ctk.CTk):
         for w in self.frame.winfo_children():
             w.destroy()
 
-        ctk.CTkLabel(self.frame, text="DG Hub", font=FONT_TITLE).pack(pady=(8, 4))
+        ctk.CTkLabel(self.frame, text=APP_NAME, font=FONT_TITLE).pack(pady=(8, 4))
         ctk.CTkLabel(
             self.frame,
-            text="Đề xuất in tem",
+            text=f"Version {APP_VERSION}",
             font=FONT_BODY,
             text_color=COLORS["muted"],
-        ).pack(pady=(0, 8))
+        ).pack(pady=(0, 16))
 
         mode_text = "Đăng nhập" if self._mode == "login" else "Đăng ký tài khoản"
         self.mode_label = ctk.CTkLabel(self.frame, text=mode_text, font=("Segoe UI", 14, "bold"))
         self.mode_label.pack(pady=(0, 12))
-
-        if supabase_enabled():
-            ctk.CTkLabel(
-                self.frame,
-                text="Xác thực qua Supabase",
-                font=FONT_SMALL,
-                text_color=COLORS["muted"],
-            ).pack(pady=(0, 8))
 
         ctk.CTkLabel(self.frame, text="Username", anchor="w").pack(fill="x", padx=8)
         self.user_entry = ctk.CTkEntry(self.frame, width=300, placeholder_text="Tên đăng nhập")
@@ -115,6 +108,7 @@ class LoginWindow(ctk.CTk):
 
     def _toggle_mode(self) -> None:
         self._mode = "register" if self._mode == "login" else "login"
+        self.geometry("420x580" if self._mode == "register" else "420x500")
         self._build_form()
 
     def _submit(self) -> None:
@@ -143,10 +137,12 @@ class LoginWindow(ctk.CTk):
             return
         messagebox.showinfo(
             "Đăng ký",
-            "Đăng ký thành công.\nTài khoản chờ admin duyệt — sau khi được duyệt mới đăng nhập được.",
+            "Đăng ký thành công.\n"
+            "Không cần xác nhận email — tài khoản chờ admin duyệt trong Setup → Phân quyền.",
             parent=self,
         )
         self._mode = "login"
+        self.geometry("420x500")
         self._build_form()
         self.user_entry.insert(0, username)
 
@@ -167,6 +163,10 @@ class LoginWindow(ctk.CTk):
             role=str(user.get("role", "design")),
         )
         access, refresh = self.auth.get_supabase_tokens()
-        db = create_user_database(session.id, access_token=access, refresh_token=refresh)
+        try:
+            db = create_user_database(session.id, access_token=access, refresh_token=refresh)
+        except Exception as exc:
+            self.error_label.configure(text=f"Lỗi khởi tạo DB: {exc}")
+            return
         state = AppState(user=session, db=db)
         self.on_success(state, self.auth)

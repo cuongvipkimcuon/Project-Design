@@ -9,11 +9,12 @@ from typing import Any
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
+from core.paths import resource_dir
 from core.utils import format_date_dd_mm_yyyy, normalize_text
 
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TEMPLATE_PATH = ROOT / "template.xlsx"
+DEFAULT_TEMPLATE_PATH = resource_dir() / "template.xlsx"
 SETUP_KEY_TEMPLATE_PATH = "supplier_template_path"
+SETUP_KEY_TEMPLATE_CLOUD_HASH = "supplier_template_cloud_hash"
 
 # Hàng / cột theo template (1-based)
 ROW_PROPOSER = 5

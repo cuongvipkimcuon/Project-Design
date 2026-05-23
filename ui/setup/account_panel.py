@@ -14,7 +14,10 @@ from core.app_state import AppState
 from core.bom_ke_reader import BomKeReaderService
 from core.permissions import MOD_SETUP_ACCOUNT
 from core.shared_dataset_service import SharedDatasetService
-from core.supplier_excel_export import DEFAULT_TEMPLATE_PATH, SETUP_KEY_TEMPLATE_PATH
+from core.supplier_excel_export import (
+    DEFAULT_TEMPLATE_PATH,
+    SETUP_KEY_TEMPLATE_PATH,
+)
 from core.supabase_config import supabase_enabled
 from core.utils import normalize_text
 from ui.theme import COLORS, FONT_BODY, FONT_SMALL
@@ -140,7 +143,7 @@ class SetupAccountPanel(ctk.CTkScrollableFrame):
         self.supplier_tpl_var = ctk.StringVar(value=tpl_saved)
         ctk.CTkLabel(
             tpl,
-            text="File mẫu in phiếu xác nhận tem/nhãn. Để trống hoặc lưu đường dẫn khác — export dùng mặc định template.xlsx trong app.",
+            text="File mẫu in phiếu xác nhận tem/nhãn. Admin lưu file → tự đẩy lên cloud; user tải về hoặc app tự đồng bộ khi đăng nhập.",
             font=FONT_SMALL,
             text_color=COLORS["muted"],
             wraplength=720,
@@ -207,8 +210,8 @@ class SetupAccountPanel(ctk.CTkScrollableFrame):
         ctk.CTkLabel(
             cloud,
             text=(
-                "Admin đọc OL / bảng kê → tự lưu cloud. Bảng kê: gửi file Excel gốc (nhỏ), "
-                "user tải về rồi parse local — không gửi hàng trăm nghìn dòng JSON."
+                "Admin đọc/chọn file → tự đẩy cloud. «Đồng bộ tất cả» tải OL, bảng kê, template, "
+                "quy tắc, EMG + plan/phiếu/tồn team. Thay đổi Design tự đẩy cloud (~2s)."
             ),
             font=FONT_SMALL,
             text_color=COLORS["muted"],
@@ -219,23 +222,34 @@ class SetupAccountPanel(ctk.CTkScrollableFrame):
         self.team_ol_label = ctk.CTkLabel(cloud, text="OL: —", font=FONT_SMALL, anchor="w")
         self.team_ol_label.pack(anchor="w", pady=2)
         self.team_bom_label = ctk.CTkLabel(cloud, text="Bảng kê: —", font=FONT_SMALL, anchor="w")
-        self.team_bom_label.pack(anchor="w", pady=(2, 10))
+        self.team_bom_label.pack(anchor="w", pady=2)
+        self.team_tpl_label = ctk.CTkLabel(cloud, text="Template phiếu: —", font=FONT_SMALL, anchor="w")
+        self.team_tpl_label.pack(anchor="w", pady=2)
+        self.team_rules_label = ctk.CTkLabel(cloud, text="Quy tắc Detail: —", font=FONT_SMALL, anchor="w")
+        self.team_rules_label.pack(anchor="w", pady=2)
+        self.team_emg_label = ctk.CTkLabel(cloud, text="EMG scanner: —", font=FONT_SMALL, anchor="w")
+        self.team_emg_label.pack(anchor="w", pady=2)
+        self.team_ops_label = ctk.CTkLabel(
+            cloud, text="Plan / phiếu / tồn: —", font=FONT_SMALL, anchor="w"
+        )
+        self.team_ops_label.pack(anchor="w", pady=(2, 10))
 
         brow = ctk.CTkFrame(cloud, fg_color="transparent")
         brow.pack(fill="x", pady=4)
         ctk.CTkButton(
             brow,
-            text="Tải OL dùng chung",
-            width=140,
+            text="Đồng bộ tất cả từ cloud",
+            width=180,
             fg_color=COLORS["accent"][1],
-            command=self._pull_team_ol,
+            command=self._pull_all_team,
         ).pack(side="left", padx=(0, 8))
         ctk.CTkButton(
             brow,
-            text="Tải bảng kê dùng chung",
-            width=160,
-            fg_color=COLORS["accent"][1],
-            command=self._pull_team_bom,
+            text="Đồng bộ plan/phiếu/tồn",
+            width=170,
+            fg_color="transparent",
+            border_width=1,
+            command=self._pull_team_ops,
         ).pack(side="left", padx=(0, 8))
 
         if self._is_admin:
@@ -258,9 +272,16 @@ class SetupAccountPanel(ctk.CTkScrollableFrame):
             msg = "Cloud: cần đăng nhập Supabase (UUID user)"
             self.team_ol_label.configure(text=f"OL: {msg}", text_color=COLORS["warning"][1])
             self.team_bom_label.configure(text=f"Bảng kê: {msg}", text_color=COLORS["warning"][1])
+            self.team_tpl_label.configure(text=f"Template phiếu: {msg}", text_color=COLORS["warning"][1])
+            self.team_rules_label.configure(text=f"Quy tắc Detail: {msg}", text_color=COLORS["warning"][1])
+            self.team_emg_label.configure(text=f"EMG scanner: {msg}", text_color=COLORS["warning"][1])
+            self.team_ops_label.configure(text=f"Plan / phiếu / tồn: {msg}", text_color=COLORS["warning"][1])
             return
         ol = self.shared.get_team_info("ol")
         bom = self.shared.get_team_info("bom_ke")
+        tpl = self.shared.get_team_info("supplier_template")
+        rules = self.shared.get_team_info("supplier_detail_rules")
+        emg = self.shared.get_team_info("emg_scanner")
         if ol:
             when = (ol.published_at or "")[:16].replace("T", " ")
             self.team_ol_label.configure(
@@ -289,19 +310,71 @@ class SetupAccountPanel(ctk.CTkScrollableFrame):
                 text="Bảng kê: chưa có bản chia sẻ",
                 text_color=COLORS["warning"][1],
             )
+        if tpl:
+            when = (tpl.published_at or "")[:16].replace("T", " ")
+            kb = int((tpl.meta or {}).get("excel_size_bytes", 0) or 0) // 1024
+            extra = f" · {kb} KB" if kb else ""
+            self.team_tpl_label.configure(
+                text=f"Template phiếu: ✓ {tpl.file_name}{extra} — {tpl.publisher_name}, {when}",
+                text_color=COLORS["success"][1],
+            )
+        else:
+            self.team_tpl_label.configure(
+                text="Template phiếu: chưa có bản chia sẻ",
+                text_color=COLORS["warning"][1],
+            )
+        if rules:
+            when = (rules.published_at or "")[:16].replace("T", " ")
+            self.team_rules_label.configure(
+                text=f"Quy tắc Detail: ✓ {rules.row_count} quy tắc — {rules.publisher_name}, {when}",
+                text_color=COLORS["success"][1],
+            )
+        else:
+            self.team_rules_label.configure(
+                text="Quy tắc Detail: chưa có bản chia sẻ",
+                text_color=COLORS["warning"][1],
+            )
+        if emg:
+            when = (emg.published_at or "")[:16].replace("T", " ")
+            kb = int((emg.meta or {}).get("excel_size_bytes", 0) or 0) // 1024
+            extra = f" · {kb} KB" if kb else ""
+            self.team_emg_label.configure(
+                text=f"EMG scanner: ✓ {emg.file_name}{extra} — {emg.publisher_name}, {when}",
+                text_color=COLORS["success"][1],
+            )
+        else:
+            self.team_emg_label.configure(
+                text="EMG scanner: chưa có bản chia sẻ",
+                text_color=COLORS["warning"][1],
+            )
+        from core.team_ops_sync import get_team_ops_status
+
+        ops = get_team_ops_status(self.state.db)
+        local_v = int(ops.get("local_version") or 0)
+        remote_v = int(ops.get("remote_version") or 0)
+        if local_v > 0 or ops.get("has_remote"):
+            when = normalize_text(ops.get("synced_at"))[:16].replace("T", " ")
+            who = normalize_text(ops.get("remote_updated_by"))
+            if not when and ops.get("remote_updated_at"):
+                when = normalize_text(ops["remote_updated_at"])[:16].replace("T", " ")
+            detail = f"v{local_v}" if local_v else "—"
+            if remote_v and remote_v != local_v:
+                detail = f"v{local_v} (cloud v{remote_v})"
+            extra = f" — {who}, {when}" if who and when else (f" — {when}" if when else "")
+            self.team_ops_label.configure(
+                text=f"Plan / phiếu / tồn: ✓ {detail}{extra}",
+                text_color=COLORS["success"][1],
+            )
+        else:
+            self.team_ops_label.configure(
+                text="Plan / phiếu / tồn: chưa đồng bộ (tự đẩy khi lưu plan/phiếu/tồn)",
+                text_color=COLORS["warning"][1],
+            )
 
     def _publish_all_team(self) -> None:
         if not self._is_admin:
             return
-        msgs: list[str] = []
-        try:
-            msgs.append(self.shared.publish_ol(publisher_name=self._publisher_name()))
-        except Exception as exc:
-            msgs.append(f"OL: {exc}")
-        try:
-            msgs.append(self.shared.publish_bom_ke(publisher_name=self._publisher_name()))
-        except Exception as exc:
-            msgs.append(f"Bảng kê: {exc}")
+        msgs = self.shared.publish_all_team_data(publisher_name=self._publisher_name())
         self._refresh_team_status()
         messagebox.showinfo("Chia sẻ cloud", "\n".join(msgs), parent=self.winfo_toplevel())
 
@@ -317,6 +390,12 @@ class SetupAccountPanel(ctk.CTkScrollableFrame):
             try:
                 if dataset_type == "ol":
                     self.shared.publish_ol(publisher_name=self._publisher_name())
+                elif dataset_type == "supplier_template":
+                    self.shared.publish_supplier_template(publisher_name=self._publisher_name())
+                elif dataset_type == "supplier_detail_rules":
+                    self.shared.publish_detail_rules(publisher_name=self._publisher_name())
+                elif dataset_type == "emg_scanner":
+                    self.shared.publish_emg_scanner(publisher_name=self._publisher_name())
                 else:
                     self.shared.publish_bom_ke(publisher_name=self._publisher_name())
             except Exception as exc:
@@ -335,6 +414,114 @@ class SetupAccountPanel(ctk.CTkScrollableFrame):
             self.after(0, done)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _pull_all_team(self) -> None:
+        self.team_ol_label.configure(text="OL: đang đồng bộ…", text_color=COLORS["muted"][1])
+        self.team_bom_label.configure(text="Bảng kê: đang đồng bộ…", text_color=COLORS["muted"][1])
+        self.team_tpl_label.configure(text="Template phiếu: đang đồng bộ…", text_color=COLORS["muted"][1])
+        self.team_rules_label.configure(text="Quy tắc Detail: đang đồng bộ…", text_color=COLORS["muted"][1])
+        self.team_emg_label.configure(text="EMG scanner: đang đồng bộ…", text_color=COLORS["muted"][1])
+        self.team_ops_label.configure(text="Plan / phiếu / tồn: đang đồng bộ…", text_color=COLORS["muted"][1])
+
+        def worker() -> None:
+            try:
+                result = self.shared.pull_all_team_data(skip_missing=True)
+                self.after(0, lambda: self._on_pull_all_done(result))
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda msg=err: self._on_team_pull_fail("Đồng bộ cloud", msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pull_team_ops(self) -> None:
+        self.team_ops_label.configure(
+            text="Plan / phiếu / tồn: đang đồng bộ…", text_color=COLORS["muted"][1]
+        )
+
+        def worker() -> None:
+            try:
+                from core.team_ops_sync import TeamOpsSyncService
+
+                ops = TeamOpsSyncService(self.state.db).sync_bidirectional(
+                    actor_name=self._publisher_name(),
+                )
+                self.after(0, lambda: self._on_team_ops_done(ops))
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda msg=err: self._on_team_pull_fail("Plan/phiếu/tồn", msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_team_ops_done(self, result) -> None:
+        if getattr(result, "needs_overwrite_confirm", False):
+            if messagebox.askyesno("Đồng bộ cloud", result.message, parent=self.winfo_toplevel()):
+                from core.team_ops_sync import TeamOpsSyncService
+
+                retry = TeamOpsSyncService(self.state.db).push(
+                    actor_name=self._publisher_name(),
+                    force=True,
+                )
+                result = retry
+            else:
+                messagebox.showinfo(
+                    "Plan / phiếu / tồn",
+                    "Chưa đẩy — cloud có bản mới hơn.",
+                    parent=self.winfo_toplevel(),
+                )
+                return
+        self._refresh_team_status()
+        if getattr(result, "pulled", False) or getattr(result, "pushed", False):
+            self.state.notify()
+        msg = getattr(result, "message", "") or "Xong."
+        if getattr(result, "errors", None):
+            msg += "\n\n" + "\n".join(result.errors)
+        messagebox.showinfo("Plan / phiếu / tồn", msg, parent=self.winfo_toplevel())
+
+    def _on_pull_all_done(self, result) -> None:
+        if result.ol_result:
+            self.state.set_ol_result(result.ol_result)
+            self._refresh_ol_status()
+        if result.bom_result:
+            self.state.set_bom_ke_result(result.bom_result)
+            self._refresh_bom_status()
+        saved_tpl = self.state.db.get_setup(SETUP_KEY_TEMPLATE_PATH, "")
+        if saved_tpl:
+            self.supplier_tpl_var.set(saved_tpl)
+            self._check_supplier_template_path()
+        saved_emg = self.state.db.get_setup("emg_scanner_json_path", "")
+        if saved_emg:
+            self.emg_path_var.set(saved_emg)
+            self._check_emg_path()
+        self._refresh_team_status()
+        if getattr(result, "ops_pulled", False) or getattr(result, "ops_pushed", False):
+            self.state.notify()
+        lines = result.messages or ["Không có mục nào tải được."]
+        if result.errors:
+            lines.append("")
+            lines.append("Bỏ qua:")
+            lines.extend(result.errors)
+        messagebox.showinfo("Đồng bộ cloud", "\n".join(lines), parent=self.winfo_toplevel())
+
+    def _pull_team_template(self) -> None:
+        self.team_tpl_label.configure(text="Template phiếu: đang tải…", text_color=COLORS["muted"][1])
+
+        def worker() -> None:
+            try:
+                msg = self.shared.pull_supplier_template()
+                self.after(0, lambda: self._on_team_template_done(msg))
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda msg=err: self._on_team_pull_fail("Template phiếu", msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_team_template_done(self, msg: str) -> None:
+        saved = self.state.db.get_setup(SETUP_KEY_TEMPLATE_PATH, "")
+        if saved:
+            self.supplier_tpl_var.set(saved)
+        self._check_supplier_template_path()
+        self._refresh_team_status()
+        messagebox.showinfo("Dữ liệu dùng chung", msg, parent=self.winfo_toplevel())
 
     def _pull_team_ol(self) -> None:
         self.team_ol_label.configure(text="OL: đang tải…", text_color=COLORS["muted"][1])
@@ -551,6 +738,7 @@ class SetupAccountPanel(ctk.CTkScrollableFrame):
         self.state.db.set_setup(SETUP_KEY_TEMPLATE_PATH, path)
         self.state.db.set_setup("supplier_template_file_name", Path(path).name)
         self._check_supplier_template_path()
+        self._auto_publish_if_admin("supplier_template")
         messagebox.showinfo("Setup", "Đã lưu template phiếu Supplier.")
 
     def _reset_supplier_template(self) -> None:
@@ -598,6 +786,7 @@ class SetupAccountPanel(ctk.CTkScrollableFrame):
         path = self.emg_path_var.get().strip()
         self.state.db.set_setup("emg_scanner_json_path", path)
         self._check_emg_path()
+        self._auto_publish_if_admin("emg_scanner")
         messagebox.showinfo("Setup", "Đã lưu link EMG JSON.")
 
     def _check_emg_path(self) -> None:

@@ -19,6 +19,8 @@ from core.db.migrations import (
     ensure_planning_columns,
     ensure_planning_prepare_items_table,
     ensure_bom_ke_column_names,
+    ensure_npl_stock_tables,
+    ensure_performance_indexes,
     ensure_supplier_tables,
     ensure_user_approval_column,
     ensure_user_role_column,
@@ -28,7 +30,7 @@ if TYPE_CHECKING:
     from core.user_cloud import UserCloud
 from core.permissions import DEFAULT_ROLE, normalize_role
 from core.db.schema import PLANNING_ACTIVE_FILTER, build_indexes, build_schema
-from core.utils import hash_password, normalize_text
+from core.utils import hash_password, normalize_dg_case, normalize_text
 
 DB_FILE = "dg_hub.db"
 
@@ -57,6 +59,11 @@ class HubDatabase:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_file)
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA cache_size = -64000")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA mmap_size = 268435456")
         return conn
 
     def _init_db(self) -> None:
@@ -72,12 +79,19 @@ class HubDatabase:
         ensure_owner_cache_tables(cur)
         ensure_bom_ke_column_names(cur)
         ensure_supplier_tables(cur)
+        ensure_npl_stock_tables(cur)
         for sql in build_indexes():
             cur.execute(sql)
+        ensure_performance_indexes(cur)
         conn.commit()
         conn.close()
 
     # --- Users (admin thêm trực tiếp DB hoặc tools/add_user.py) ---
+
+    def notify_ops_changed(self, *, actor_name: str = "") -> None:
+        from core.team_ops_sync import notify_team_ops_changed
+
+        notify_team_ops_changed(self, actor_name=actor_name)
 
     def count_users(self) -> int:
         conn = self._connect()
@@ -370,6 +384,7 @@ class HubDatabase:
         verify_date_iso: str,
         session: str = "",
         supplier: str = "",
+        customer_code: str = "",
         created_by: int | None = None,
         actor: str = "",
     ) -> int:
@@ -379,16 +394,17 @@ class HubDatabase:
         cur.execute(
             """
             INSERT INTO planning_entries(
-                dg_case, item_code, supplier, quantity, plan_date, plan_date_iso,
+                dg_case, item_code, supplier, customer_code, quantity, plan_date, plan_date_iso,
                 verify_date, verify_date_iso, session, status,
                 check_status, prepare_status,
                 created_by, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', 'pending', 'pending', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', 'pending', 'pending', ?, ?, ?)
             """,
             (
                 dg_case,
                 item_code,
                 supplier,
+                normalize_text(customer_code),
                 quantity,
                 plan_date,
                 plan_date_iso,
@@ -401,23 +417,113 @@ class HubDatabase:
             ),
         )
         entry_id = int(cur.lastrowid)
+        from core.planning_service import plan_snapshot
+
+        snap = plan_snapshot(
+            {
+                "dg_case": dg_case,
+                "item_code": item_code,
+                "supplier": supplier,
+                "quantity": quantity,
+                "plan_date": plan_date,
+                "plan_date_iso": plan_date_iso,
+                "verify_date": verify_date,
+                "verify_date_iso": verify_date_iso,
+                "session": session,
+            }
+        )
         self._append_planning_audit(
             cur,
             entry_id=entry_id,
             action="created",
             actor=actor,
             actor_user_id=created_by,
-            detail={
-                "dg_case": dg_case,
-                "item_code": item_code,
-                "supplier": supplier,
-                "plan_date": plan_date,
-                "verify_date": verify_date,
-            },
+            detail={"after": snap},
         )
         conn.commit()
         conn.close()
+        self.notify_ops_changed(actor_name=actor)
         return entry_id
+
+    def update_planning_entry(
+        self,
+        entry_id: int,
+        *,
+        dg_case: str,
+        item_code: str,
+        supplier: str,
+        quantity: float,
+        plan_date: str,
+        plan_date_iso: str,
+        verify_date: str,
+        verify_date_iso: str,
+        session: str,
+        actor: str = "",
+        actor_user_id: int | None = None,
+    ) -> None:
+        from core import supplier_db
+        from core.planning_service import plan_snapshot
+
+        entry = self.get_planning_entry(entry_id)
+        if not entry:
+            raise ValueError("Không tìm thấy plan.")
+        if normalize_text(entry.get("check_status")) == "confirmed":
+            raise ValueError("Plan đã lưu (confirmed) — không sửa được.")
+        if entry_id in supplier_db.plan_ids_on_pending_slips(self):
+            raise ValueError("Plan đang trên phiếu pending — sửa/hủy phiếu trước.")
+
+        before = plan_snapshot(entry)
+        after = plan_snapshot(
+            {
+                "dg_case": dg_case,
+                "item_code": item_code,
+                "supplier": supplier,
+                "quantity": quantity,
+                "plan_date": plan_date,
+                "plan_date_iso": plan_date_iso,
+                "verify_date": verify_date,
+                "verify_date_iso": verify_date_iso,
+                "session": session,
+            }
+        )
+
+        ts = now_iso()
+        conn = self._connect()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE planning_entries
+            SET dg_case = ?, item_code = ?, supplier = ?, quantity = ?,
+                plan_date = ?, plan_date_iso = ?,
+                verify_date = ?, verify_date_iso = ?,
+                session = ?, updated_at = ?
+            WHERE id = ? AND is_deleted = 0
+            """,
+            (
+                dg_case,
+                item_code,
+                supplier,
+                quantity,
+                plan_date,
+                plan_date_iso,
+                verify_date,
+                verify_date_iso,
+                session,
+                ts,
+                entry_id,
+            ),
+        )
+        self._append_planning_audit(
+            cur,
+            entry_id=entry_id,
+            action="updated",
+            actor=actor,
+            actor_user_id=actor_user_id,
+            detail={"before": before, "after": after},
+        )
+        conn.commit()
+        conn.close()
+        self.notify_ops_changed(actor_name=actor)
 
     def update_planning_entry_status(self, entry_id: int, status: str) -> None:
         now = datetime.now().isoformat(timespec="seconds")
@@ -461,6 +567,8 @@ class HubDatabase:
             )
         conn.commit()
         conn.close()
+        if check_status == "confirmed":
+            self.notify_ops_changed(actor_name=check_by)
 
     def update_planning_prepare_status(
         self, entry_id: int, prepare_status: str, *, prepare_by: str = "", actor_user_id: int | None = None
@@ -523,8 +631,8 @@ class HubDatabase:
             cur.execute(
                 """
                 INSERT INTO planning_prepare_items(
-                    entry_id, row_index, ma_npl, ten_npl, mo_ta, quantity, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    entry_id, row_index, ma_npl, ten_npl, mo_ta, quantity, npl_stock_type_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry_id,
@@ -533,6 +641,7 @@ class HubDatabase:
                     normalize_text(item.get("ten_npl")),
                     normalize_text(item.get("mo_ta")),
                     float(item.get("quantity", 0) or 0),
+                    int(item["npl_stock_type_id"]) if item.get("npl_stock_type_id") else None,
                     ts,
                 ),
             )
@@ -554,6 +663,7 @@ class HubDatabase:
         )
         conn.commit()
         conn.close()
+        self.notify_ops_changed(actor_name=prepare_by)
 
     def sync_planning_miss_flags(self, today_iso: str) -> None:
         ts = now_iso()
@@ -564,8 +674,8 @@ class HubDatabase:
             SET check_status = 'miss', updated_at = ?
             WHERE {PLANNING_ACTIVE_FILTER}
               AND check_status = 'pending'
-              AND verify_date_iso != ''
-              AND verify_date_iso <= ?
+              AND plan_date_iso != ''
+              AND plan_date_iso <= ?
             """,
             (ts, today_iso),
         )
@@ -606,6 +716,7 @@ class HubDatabase:
         )
         conn.commit()
         conn.close()
+        self.notify_ops_changed(actor_name=deleted_by)
         return True
 
     def delete_planning_entry(self, entry_id: int) -> None:
@@ -668,6 +779,79 @@ class HubDatabase:
             out.append(item)
         return out
 
+    def find_planning_duplicate(
+        self,
+        dg_case: str,
+        *,
+        exclude_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Active plan with the same normalized DG case (each case is independent)."""
+        key = normalize_dg_case(dg_case)
+        if not key:
+            return None
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        params: list[Any] = []
+        sql = f"SELECT * FROM planning_entries WHERE {PLANNING_ACTIVE_FILTER}"
+        variants = {key}
+        if key.startswith("O-"):
+            variants.add("0-" + key[2:])
+        if key.startswith("0-"):
+            variants.add("O-" + key[2:])
+        placeholders = ", ".join("?" for _ in variants)
+        sql += f" AND UPPER(REPLACE(COALESCE(dg_case, ''), ' ', '')) IN ({placeholders})"
+        params.extend(sorted(variants))
+        if exclude_id is not None:
+            sql += " AND id != ?"
+            params.append(int(exclude_id))
+        sql += " ORDER BY id DESC LIMIT 5"
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        for row in rows:
+            item = dict(row)
+            if normalize_dg_case(item.get("dg_case")) == key:
+                return item
+        return None
+
+    def list_planning_entry_history(self, entry_id: int) -> list[dict[str, Any]]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT
+                a.id AS audit_id,
+                a.entry_id,
+                a.action,
+                a.actor,
+                a.actor_user_id,
+                a.detail_json,
+                a.created_at,
+                e.dg_case,
+                e.item_code,
+                e.supplier,
+                e.quantity,
+                e.plan_date,
+                e.verify_date,
+                e.deleted_at,
+                e.deleted_by
+            FROM planning_audit_log a
+            LEFT JOIN planning_entries e ON e.id = a.entry_id
+            WHERE a.entry_id = ?
+            ORDER BY a.created_at ASC, a.id ASC
+            """,
+            (entry_id,),
+        ).fetchall()
+        conn.close()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            try:
+                item["detail"] = json.loads(item.pop("detail_json") or "{}")
+            except json.JSONDecodeError:
+                item["detail"] = {}
+            out.append(item)
+        return out
+
     def list_planning_pending_verify(self, *, up_to_iso: str) -> list[dict[str, Any]]:
         conn = self._connect()
         conn.row_factory = sqlite3.Row
@@ -676,11 +860,26 @@ class HubDatabase:
             SELECT * FROM planning_entries
             WHERE {PLANNING_ACTIVE_FILTER}
               AND check_status != 'confirmed'
-              AND verify_date_iso != ''
-              AND verify_date_iso <= ?
-            ORDER BY verify_date_iso ASC, plan_date_iso ASC, id ASC
+              AND plan_date_iso != ''
+              AND plan_date_iso <= ?
+            ORDER BY plan_date_iso ASC, id ASC
             """,
             (up_to_iso,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def list_planning_needs_delivery_date(self) -> list[dict[str, Any]]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT * FROM planning_entries
+            WHERE {PLANNING_ACTIVE_FILTER}
+              AND check_status != 'confirmed'
+              AND (plan_date_iso IS NULL OR plan_date_iso = '')
+            ORDER BY verify_date_iso ASC, id ASC
+            """
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
@@ -693,9 +892,9 @@ class HubDatabase:
             SELECT * FROM planning_entries
             WHERE {PLANNING_ACTIVE_FILTER}
               AND check_status != 'confirmed'
-              AND verify_date_iso >= ?
-              AND verify_date_iso <= ?
-            ORDER BY verify_date_iso ASC, id ASC
+              AND plan_date_iso >= ?
+              AND plan_date_iso <= ?
+            ORDER BY plan_date_iso ASC, id ASC
             """,
             (from_iso, to_iso),
         ).fetchall()
@@ -804,11 +1003,94 @@ class HubDatabase:
             return None
         return self.get_ol_dataset_by_id(int(raw))
 
-    def load_active_ol_df(self) -> pd.DataFrame | None:
-        meta = self.get_active_ol_dataset_meta()
-        if not meta:
+    def _count_bom_ke_rows(self, dataset_id: int) -> int:
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM bom_ke_rows WHERE dataset_id = ?",
+            (int(dataset_id),),
+        ).fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+
+    def _count_ol_rows(self, dataset_id: int) -> int:
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM ol_rows WHERE dataset_id = ?",
+            (int(dataset_id),),
+        ).fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+
+    def resolve_bom_ke_dataset_id(self, a6_hash: str) -> int | None:
+        """Chọn bản bảng kê đầy đủ nhất (nhiều dòng nhất) — tránh bản cloud cắt 5k dòng."""
+        key = normalize_text(a6_hash)
+        if not key:
             return None
-        return self._load_ol_rows_df(int(meta["id"]))
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT d.id, d.owner_id, COALESCE(d.row_count, 0) AS cnt
+            FROM bom_ke_datasets d
+            WHERE d.a6_hash = ?
+            ORDER BY cnt DESC,
+                     CASE WHEN d.owner_id = ? THEN 0 ELSE 1 END,
+                     d.id DESC
+            """,
+            (key, self._oid()),
+        ).fetchall()
+        conn.close()
+        for dataset_id, _owner, cnt in rows:
+            if int(cnt) > 0:
+                return int(dataset_id)
+        return None
+
+    def resolve_active_ol_dataset_id(self) -> int | None:
+        """OL đang active — fallback dataset cùng owner (hoặc global) có dòng thực tế."""
+        meta = self.get_active_ol_dataset_meta()
+        conn = self._connect()
+
+        def _best(candidates: list[tuple[int, int]]) -> int | None:
+            for dataset_id, cnt in sorted(candidates, key=lambda x: (-x[1], -x[0])):
+                if cnt > 0:
+                    return int(dataset_id)
+            return None
+
+        if meta:
+            preferred = int(meta["id"])
+            stored = int(meta.get("row_count") or 0)
+            if stored > 0:
+                conn.close()
+                return preferred
+            cnt = self._count_ol_rows(preferred)
+            if cnt > 0:
+                conn.close()
+                return preferred
+        rows = conn.execute(
+            """
+            SELECT d.id, COALESCE(d.row_count, 0) AS cnt
+            FROM ol_datasets d
+            WHERE d.owner_id = ?
+            """,
+            (self._oid(),),
+        ).fetchall()
+        picked = _best([(int(r[0]), int(r[1])) for r in rows])
+        if picked is not None:
+            conn.close()
+            return picked
+        rows = conn.execute(
+            """
+            SELECT d.id, COALESCE(d.row_count, 0) AS cnt
+            FROM ol_datasets d
+            """
+        ).fetchall()
+        conn.close()
+        return _best([(int(r[0]), int(r[1])) for r in rows])
+
+    def load_active_ol_df(self) -> pd.DataFrame | None:
+        dataset_id = self.resolve_active_ol_dataset_id()
+        if dataset_id is None:
+            return None
+        return self._load_ol_rows_df(dataset_id)
 
     def save_ol_dataset(self, file_path: str, file_hash: str, df: pd.DataFrame) -> int:
         path = str(Path(file_path).resolve())
@@ -1016,10 +1298,10 @@ class HubDatabase:
         return dataset_id
 
     def load_bom_ke_dataset_df(self, a6_hash: str) -> pd.DataFrame | None:
-        meta = self.get_bom_ke_dataset(a6_hash)
-        if not meta:
+        dataset_id = self.resolve_bom_ke_dataset_id(a6_hash)
+        if dataset_id is None:
             return None
-        return self._load_bom_ke_rows_df(int(meta["id"]))
+        return self._load_bom_ke_rows_df(dataset_id)
 
     def query_bom_ke_rows(
         self,
@@ -1147,6 +1429,7 @@ class HubDatabase:
                 "excel_row": df["excel_row"].fillna(0).astype(int),
             }
         )
+        out["_dg_norm"] = out["dg_case"].map(normalize_dg_case)
         return out
 
     def _load_bom_ke_rows_df(self, dataset_id: int) -> pd.DataFrame:

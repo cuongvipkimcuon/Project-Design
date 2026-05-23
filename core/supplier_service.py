@@ -9,8 +9,9 @@ import pandas as pd
 from core import supplier_db
 from core.database import HubDatabase
 from core.ol_reader import OlReaderService
-from core.planning_service import effective_check_status
+from core.planning_service import effective_check_status, effective_prepare_status
 from core.prepare_service import list_label_candidates
+from core.supplier_detail_autofill import apply_detail_autofill_lines
 from core.utils import format_date_dd_mm_yyyy, normalize_dg_case, normalize_text
 
 DEFAULT_REASON = "giao lần đầu"
@@ -89,7 +90,7 @@ def build_lines_from_plans(
     ol_df: pd.DataFrame | None,
     bom_df: pd.DataFrame | None,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Mỗi plan → dòng nhãn từ prepare; không có prepare thì 1 dòng plan."""
+    """Mỗi plan phải đã Prepare — một dòng phiếu / dòng prepare."""
     plans: list[dict] = []
     for pid in plan_ids:
         conn = db._connect()
@@ -111,55 +112,46 @@ def build_lines_from_plans(
     if len(suppliers) != 1:
         raise ValueError("Tất cả plan trong phiếu phải cùng một Supplier.")
 
+    on_pending = supplier_db.plan_ids_on_pending_slips(db)
     supplier = suppliers.pop()
     lines: list[dict] = []
     n = 1
     for plan in plans:
         if effective_check_status(plan) == "confirmed":
-            raise ValueError(f"Plan {plan.get('dg_case')} đã check — không đưa vào phiếu mới.")
+            raise ValueError(f"Plan {plan.get('dg_case')} đã lưu — không đưa vào phiếu mới.")
         pid = int(plan["id"])
+        if pid in on_pending:
+            raise ValueError(f"Plan {plan.get('dg_case')} đang nằm trong phiếu pending khác.")
+        if effective_prepare_status(plan) != "prepared":
+            raise ValueError(
+                f"Plan {plan.get('dg_case')} chưa Prepare.\n"
+                "Vào Planning → chọn ngày → Prepare trước khi tạo phiếu."
+            )
         prepared = db.list_planning_prepare_items(pid)
-        if prepared:
-            for pr in prepared:
-                lines.append(
-                    build_line_from_plan(
-                        db,
-                        plan,
-                        ol_df=ol_df,
-                        bom_df=bom_df,
-                        line_no=n,
-                        prepare_row=pr,
-                    )
-                )
-                n += 1
-        else:
+        if not prepared:
             label_rows = list_label_candidates(bom_df, str(plan.get("dg_case", "")))
             if label_rows:
-                for lr in label_rows:
-                    lines.append(
-                        {
-                            "line_no": n,
-                            "material_code": normalize_text(lr.get("ma_npl")),
-                            "product_code": normalize_text(plan.get("item_code")),
-                            "dg_case": normalize_text(plan.get("dg_case")),
-                            "color": "",
-                            "logo": "",
-                            "quantity": float(plan.get("quantity") or lr.get("quantity") or 0),
-                            "detail": "",
-                            "plan_entry_id": pid,
-                            "prepare_item_id": None,
-                            "is_custom": False,
-                        }
-                    )
-                    if ol_df is not None:
-                        ol = OlReaderService(db).lookup_fields_for_dg_case(ol_df, str(plan.get("dg_case")))
-                        lines[-1]["color"] = ol.get("color", "")
-                        lines[-1]["logo"] = ol.get("logo", "")
-                    n += 1
-            else:
-                lines.append(build_line_from_plan(db, plan, ol_df=ol_df, bom_df=bom_df, line_no=n))
-                n += 1
+                raise ValueError(
+                    f"Plan {plan.get('dg_case')} chưa Prepare dù có nhãn trong bảng kê.\n"
+                    "Mở Prepare và chọn dòng nhãn trước."
+                )
+            raise ValueError(
+                f"Plan {plan.get('dg_case')} không có dòng nhãn — kiểm tra bảng kê hoặc bỏ khỏi queue."
+            )
+        for pr in prepared:
+            lines.append(
+                build_line_from_plan(
+                    db,
+                    plan,
+                    ol_df=ol_df,
+                    bom_df=bom_df,
+                    line_no=n,
+                    prepare_row=pr,
+                )
+            )
+            n += 1
 
+    lines = apply_detail_autofill_lines(lines, db=db, ol_df=ol_df, bom_df=bom_df)
     return lines, supplier
 
 

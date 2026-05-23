@@ -35,10 +35,39 @@ def role_label(role: str) -> str:
 
 
 def can_access(role: str, module: str) -> bool:
-    """Ai cũng xem/lọc được; Phân Quyền chỉ admin."""
+    """Tab/module hiển thị theo role."""
+    r = normalize_role(role)
     if module == MOD_SETUP_PERMISSIONS:
-        return normalize_role(role) == "admin"
+        return r == "admin"
+    if module in _DESIGN_MODULES:
+        return r in ("admin", "design")
+    if module == MOD_SALES:
+        return r in ("admin", "sales")
+    if module == MOD_SETUP_ACCOUNT:
+        return r in ("admin", "design", "sales")
     return True
+
+
+def visible_nav_pages(role: str) -> list[tuple[str, str]]:
+    """Sidebar: (key, label)."""
+    r = normalize_role(role)
+    pages: list[tuple[str, str]] = []
+    if r in ("admin", "design", "sales"):
+        pages.append(("setup", "Setup"))
+    if r in ("admin", "sales"):
+        pages.append(("sales", "Sales"))
+    if r in ("admin", "design"):
+        pages.append(("design", "Design"))
+    return pages
+
+
+def default_nav_page(role: str) -> str:
+    r = normalize_role(role)
+    if r == "design":
+        return "design"
+    if r == "sales":
+        return "sales"
+    return "setup"
 
 
 def can_write(role: str, module: str) -> bool:
@@ -55,3 +84,8 @@ def can_write(role: str, module: str) -> bool:
     if module == MOD_SALES:
         return r == "sales"
     return False
+
+
+def can_manage_npl_types(role: str) -> bool:
+    """Thêm / sửa / xóa loại NPL theo dõi — chỉ admin (tránh hư cấu hình team)."""
+    return normalize_role(role) == "admin"

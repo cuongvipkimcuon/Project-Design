@@ -30,6 +30,7 @@ from core.utils import (
     extract_item_code_from_product_code,
     hash_text,
     looks_like_dg_case,
+    normalize_dg_case,
     normalize_text,
 )
 
@@ -86,7 +87,7 @@ class BomKeReaderService:
         out = pd.DataFrame(
             {
                 "row_index": data.index + 1,
-                "dg_case": data.iloc[:, COL_DG_CASE].map(normalize_text),
+                "dg_case": data.iloc[:, COL_DG_CASE].map(normalize_dg_case),
                 "order_date": pd.to_datetime(data.iloc[:, COL_ORDER_DATE], errors="coerce"),
                 "product_code": data.iloc[:, COL_PRODUCT_CODE].map(normalize_text),
                 ORDER_QTY: pd.to_numeric(data.iloc[:, COL_ORDER_QTY], errors="coerce"),
@@ -180,7 +181,7 @@ class BomKeReaderService:
         if not meta:
             return None
         df = self.db.load_bom_ke_dataset_df(key)
-        if df is None:
+        if df is None or df.empty:
             return None
         return BomKeLoadResult(
             source="cache_a6",

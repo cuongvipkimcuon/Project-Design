@@ -26,6 +26,7 @@ def ensure_planning_columns(cur: sqlite3.Cursor) -> None:
     _add_column(cur, "planning_entries", "deleted_by", "deleted_by TEXT NOT NULL DEFAULT ''")
     _add_column(cur, "planning_entries", "supplier", "supplier TEXT NOT NULL DEFAULT ''")
     _add_column(cur, "planning_entries", "prepare_at", "prepare_at TEXT NOT NULL DEFAULT ''")
+    _add_column(cur, "planning_entries", "customer_code", "customer_code TEXT NOT NULL DEFAULT ''")
 
 
 def ensure_planning_prepare_items_table(cur: sqlite3.Cursor) -> None:
@@ -39,10 +40,17 @@ def ensure_planning_prepare_items_table(cur: sqlite3.Cursor) -> None:
             ten_npl TEXT NOT NULL DEFAULT '',
             mo_ta TEXT NOT NULL DEFAULT '',
             quantity REAL NOT NULL DEFAULT 0,
+            npl_stock_type_id INTEGER,
             created_at TEXT NOT NULL,
             FOREIGN KEY(entry_id) REFERENCES planning_entries(id) ON DELETE CASCADE
         )
         """
+    )
+    _add_column(
+        cur,
+        "planning_prepare_items",
+        "npl_stock_type_id",
+        "npl_stock_type_id INTEGER",
     )
 
 
@@ -195,6 +203,34 @@ def ensure_supplier_tables(cur: sqlite3.Cursor) -> None:
     for sql in build_schema():
         if "supplier_slip" in sql:
             cur.execute(sql)
+
+
+def ensure_npl_stock_tables(cur: sqlite3.Cursor) -> None:
+    from core.db.schema import build_schema
+
+    for sql in build_schema():
+        if "npl_stock" in sql:
+            cur.execute(sql)
+
+
+def ensure_performance_indexes(cur: sqlite3.Cursor) -> None:
+    """Index bổ sung cho DB cũ — an toàn chạy lại nhiều lần."""
+    from core.db.schema import build_indexes
+
+    existing = {
+        str(r[0])
+        for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+    for sql in build_indexes():
+        name = sql.split("IF NOT EXISTS", 1)[-1].split("ON", 1)[0].strip()
+        if name in existing:
+            continue
+        try:
+            cur.execute(sql)
+        except sqlite3.OperationalError:
+            pass
 
 
 def ensure_planning_audit_table(cur: sqlite3.Cursor) -> None:

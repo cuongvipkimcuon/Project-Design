@@ -1,7 +1,8 @@
-"""Tao super admin qua Postgres (ho tro mat khau ngan)."""
+"""Tao user Auth + profiles qua Postgres (khong qua API sign_up — tranh rate limit)."""
 
 from __future__ import annotations
 
+from core.permissions import normalize_role
 from core.supabase_config import AUTH_EMAIL_DOMAIN, get_database_url
 
 
@@ -9,20 +10,33 @@ def _esc(text: str) -> str:
     return text.replace("'", "''")
 
 
-def bootstrap_super_admin(
-    username: str = "admin",
-    password: str = "1",
-    display_name: str = "Administrator",
+def bootstrap_auth_user(
+    username: str,
+    password: str,
+    display_name: str = "",
+    *,
+    role: str = "design",
+    approval_status: str = "approved",
+    is_active: bool = True,
 ) -> dict[str, str | bool]:
     url = get_database_url()
     if not url:
         raise RuntimeError("Can DATABASE_URL trong .env")
 
-    email = f"{username.strip().lower()}@{AUTH_EMAIL_DOMAIN}"
-    uname = _esc(username.strip().lower())
-    dname = _esc(display_name.strip() or username.strip())
+    uname_raw = username.strip().lower()
+    if len(uname_raw) < 2:
+        raise ValueError("Username phai co it nhat 2 ky tu.")
+    if len(password) < 6:
+        raise ValueError("Mat khau toi thieu 6 ky tu.")
+
+    email = f"{uname_raw}@{AUTH_EMAIL_DOMAIN}"
+    uname = _esc(uname_raw)
+    dname = _esc(display_name.strip() or uname_raw)
     pwd = _esc(password)
     em = _esc(email)
+    role_sql = _esc(normalize_role(role))
+    status_sql = _esc(approval_status.strip() or "approved")
+    active_sql = "TRUE" if is_active else "FALSE"
 
     import psycopg
 
@@ -69,13 +83,13 @@ def bootstrap_super_admin(
               END IF;
 
               INSERT INTO public.profiles (id, username, display_name, role, is_active, approval_status)
-              VALUES (uid, '{uname}', '{dname}', 'admin', TRUE, 'approved')
+              VALUES (uid, '{uname}', '{dname}', '{role_sql}', {active_sql}, '{status_sql}')
               ON CONFLICT (id) DO UPDATE SET
                 username = EXCLUDED.username,
                 display_name = EXCLUDED.display_name,
-                role = 'admin',
-                is_active = TRUE,
-                approval_status = 'approved';
+                role = EXCLUDED.role,
+                is_active = EXCLUDED.is_active,
+                approval_status = EXCLUDED.approval_status;
             END $$;
             """
         )
@@ -86,11 +100,11 @@ def bootstrap_super_admin(
             FROM public.profiles
             WHERE lower(username) = lower(%s)
             """,
-            (uname,),
+            (uname_raw,),
         ).fetchone()
 
     if not row:
-        raise RuntimeError("Khong tao duoc admin trong profiles")
+        raise RuntimeError("Khong tao duoc user trong profiles")
     return {
         "id": str(row[0]),
         "username": str(row[1]),
@@ -99,3 +113,18 @@ def bootstrap_super_admin(
         "is_active": bool(row[4]),
         "approval_status": str(row[5]),
     }
+
+
+def bootstrap_super_admin(
+    username: str = "admin",
+    password: str = "1",
+    display_name: str = "Administrator",
+) -> dict[str, str | bool]:
+    return bootstrap_auth_user(
+        username,
+        password,
+        display_name,
+        role="admin",
+        approval_status="approved",
+        is_active=True,
+    )

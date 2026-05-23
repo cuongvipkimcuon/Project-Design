@@ -156,6 +156,7 @@ def build_schema(backend: DbBackend = DbBackend.SQLITE) -> list[str]:
             is_deleted INTEGER NOT NULL DEFAULT 0,
             deleted_at TEXT NOT NULL DEFAULT '',
             deleted_by TEXT NOT NULL DEFAULT '',
+            customer_code TEXT NOT NULL DEFAULT '',
             created_by INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -170,6 +171,7 @@ def build_schema(backend: DbBackend = DbBackend.SQLITE) -> list[str]:
             ten_npl TEXT NOT NULL DEFAULT '',
             mo_ta TEXT NOT NULL DEFAULT '',
             quantity REAL NOT NULL DEFAULT 0,
+            npl_stock_type_id INTEGER,
             created_at TEXT NOT NULL,
             FOREIGN KEY(entry_id) REFERENCES planning_entries(id) ON DELETE CASCADE
         )
@@ -247,6 +249,63 @@ def build_schema(backend: DbBackend = DbBackend.SQLITE) -> list[str]:
             updated_at TEXT NOT NULL
         )
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS npl_stock_types (
+            id {pk},
+            owner_id TEXT NOT NULL DEFAULT '',
+            module TEXT NOT NULL DEFAULT '',
+            code TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL DEFAULT '',
+            unit_label TEXT NOT NULL DEFAULT 'pcs',
+            divisor REAL NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS npl_stock_balances (
+            owner_id TEXT NOT NULL DEFAULT '',
+            stock_type_id INTEGER NOT NULL,
+            balance REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (owner_id, stock_type_id),
+            FOREIGN KEY(stock_type_id) REFERENCES npl_stock_types(id) ON DELETE CASCADE
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS npl_stock_batches (
+            id {pk},
+            owner_id TEXT NOT NULL DEFAULT '',
+            stock_type_id INTEGER NOT NULL,
+            batch_code TEXT NOT NULL DEFAULT '',
+            balance REAL NOT NULL DEFAULT 0,
+            qty_pcs_initial REAL NOT NULL DEFAULT 0,
+            receipt_ledger_id INTEGER,
+            note TEXT NOT NULL DEFAULT '',
+            actor TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(stock_type_id) REFERENCES npl_stock_types(id) ON DELETE CASCADE
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS npl_stock_ledger (
+            id {pk},
+            owner_id TEXT NOT NULL DEFAULT '',
+            stock_type_id INTEGER NOT NULL,
+            txn_type TEXT NOT NULL DEFAULT '',
+            qty_pcs REAL NOT NULL DEFAULT 0,
+            qty_delta REAL NOT NULL DEFAULT 0,
+            balance_after REAL NOT NULL DEFAULT 0,
+            slip_id INTEGER,
+            slip_line_id INTEGER,
+            ref_txn_id INTEGER,
+            note TEXT NOT NULL DEFAULT '',
+            actor TEXT NOT NULL DEFAULT '',
+            meta_json TEXT NOT NULL DEFAULT '{{}}',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(stock_type_id) REFERENCES npl_stock_types(id)
+        )
+        """,
     ]
 
 
@@ -284,6 +343,28 @@ def build_indexes() -> list[str]:
         "CREATE INDEX IF NOT EXISTS idx_supplier_lines_dg ON supplier_slip_lines(dg_case)",
         "CREATE INDEX IF NOT EXISTS idx_supplier_lines_product ON supplier_slip_lines(product_code)",
         "CREATE INDEX IF NOT EXISTS idx_supplier_audit_slip ON supplier_slip_audit(slip_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_npl_stock_types_owner ON npl_stock_types(owner_id, module, code)",
+        "CREATE INDEX IF NOT EXISTS idx_npl_stock_types_module ON npl_stock_types(module, is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_npl_ledger_type ON npl_stock_ledger(stock_type_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_npl_ledger_slip ON npl_stock_ledger(slip_id, txn_type)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_npl_batches_code ON npl_stock_batches(owner_id, stock_type_id, batch_code)",
+        "CREATE INDEX IF NOT EXISTS idx_npl_batches_fifo ON npl_stock_batches(stock_type_id, created_at, id)",
+        "CREATE INDEX IF NOT EXISTS idx_npl_batches_owner ON npl_stock_batches(owner_id, stock_type_id)",
+        # --- performance composites (large OL/BOM + planning filters) ---
+        "CREATE INDEX IF NOT EXISTS idx_ol_rows_dataset_excel ON ol_rows(dataset_id, excel_row)",
+        "CREATE INDEX IF NOT EXISTS idx_ol_rows_dataset_dg ON ol_rows(dataset_id, dg_case)",
+        "CREATE INDEX IF NOT EXISTS idx_ol_datasets_owner ON ol_datasets(owner_id)",
+        "CREATE INDEX IF NOT EXISTS idx_bom_ke_rows_dataset_row ON bom_ke_rows(dataset_id, row_index)",
+        "CREATE INDEX IF NOT EXISTS idx_bom_ke_rows_dataset_dg ON bom_ke_rows(dataset_id, dg_case)",
+        "CREATE INDEX IF NOT EXISTS idx_planning_active_date ON planning_entries(is_deleted, plan_date_iso, session, id)",
+        "CREATE INDEX IF NOT EXISTS idx_planning_active_check ON planning_entries(is_deleted, check_status, plan_date_iso)",
+        "CREATE INDEX IF NOT EXISTS idx_planning_active_verify ON planning_entries(is_deleted, check_status, verify_date_iso)",
+        "CREATE INDEX IF NOT EXISTS idx_planning_active_dg ON planning_entries(is_deleted, dg_case)",
+        "CREATE INDEX IF NOT EXISTS idx_planning_prepare_entry_row ON planning_prepare_items(entry_id, row_index)",
+        "CREATE INDEX IF NOT EXISTS idx_supplier_slips_owner_created ON supplier_slips(owner_id, created_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_supplier_lines_plan ON supplier_slip_lines(plan_entry_id)",
+        "CREATE INDEX IF NOT EXISTS idx_npl_ledger_owner_created ON npl_stock_ledger(owner_id, created_at DESC, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_npl_batches_owner_fifo ON npl_stock_batches(owner_id, stock_type_id, created_at, id)",
     ]
 
 

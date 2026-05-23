@@ -5,8 +5,10 @@ from __future__ import annotations
 import customtkinter as ctk
 
 from core.app_state import AppState
+from core.npl_stock_service import MODULE_PICTOGRAM, MODULE_PLASTIC_LABEL
+from core.permissions import MOD_DESIGN_PICTOGRAM, MOD_DESIGN_PLASTIC, MOD_DESIGN_SUPPLIER
+from ui.npl_stock_panel import NplStockPanel
 from ui.planning_panel import PlanningPanel
-from ui.placeholder_panel import PlaceholderPanel
 from ui.supplier_panel import SupplierPanel
 from ui.theme import COLORS, FONT_TITLE
 
@@ -32,10 +34,10 @@ class DesignPanel(ctk.CTkFrame):
         tabs.grid(row=0, column=1)
         self.sub_buttons: dict[str, ctk.CTkButton] = {}
         for key, label in [
-            ("planning", "Planning"),
+            ("planning", "Plan"),
+            ("supplier", "Supplier"),
             ("plastic_label", "Plastic Label"),
             ("pictogram", "Pictogram"),
-            ("supplier", "Supplier"),
         ]:
             btn = ctk.CTkButton(
                 tabs,
@@ -53,21 +55,31 @@ class DesignPanel(ctk.CTkFrame):
         self.sub_content.grid_columnconfigure(0, weight=1)
         self.sub_content.grid_rowconfigure(0, weight=1)
 
+        self.supplier_panel = SupplierPanel(self.sub_content, state)
+        open_slip = self._open_supplier_slip
         self.sub_pages: dict[str, ctk.CTkFrame] = {
             "planning": PlanningPanel(self.sub_content, state),
-            "plastic_label": PlaceholderPanel(
+            "supplier": self.supplier_panel,
+            "plastic_label": NplStockPanel(
                 self.sub_content,
-                title="Plastic Label Management",
-                description="Quản lý tem nhựa — module sẽ được bổ sung sau.",
+                state,
+                module=MODULE_PLASTIC_LABEL,
+                perm_module=MOD_DESIGN_PLASTIC,
+                on_open_slip=open_slip,
             ),
-            "pictogram": PlaceholderPanel(
+            "pictogram": NplStockPanel(
                 self.sub_content,
-                title="Pictogram Management",
-                description="Quản lý pictogram — module sẽ được bổ sung sau.",
+                state,
+                module=MODULE_PICTOGRAM,
+                perm_module=MOD_DESIGN_PICTOGRAM,
+                on_open_slip=open_slip,
             ),
-            "supplier": SupplierPanel(self.sub_content, state),
         }
         self._show_sub("planning")
+
+    def _open_supplier_slip(self, slip_id: int) -> None:
+        self._show_sub("supplier")
+        self.supplier_panel.open_slip(int(slip_id))
 
     def _show_sub(self, key: str) -> None:
         for page in self.sub_pages.values():

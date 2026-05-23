@@ -1,5 +1,5 @@
 """
-DG Hub — Đề xuất in tem (CustomTkinter).
+DG House (CustomTkinter).
 
 Đăng nhập → Setup | Sales | Design
 """
@@ -11,18 +11,23 @@ from pathlib import Path
 
 import customtkinter as ctk
 
+from core.paths import ensure_app_cwd
+
+ensure_app_cwd()
+
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.app_state import AppState
 from core.auth import AuthService
-from core.permissions import role_label
+from core.permissions import default_nav_page, role_label, visible_nav_pages
+from core.shared_dataset_service import SharedDatasetService
 from ui.design_panel import DesignPanel
 from ui.login_window import LoginWindow
 from ui.sales_panel import SalesPanel
 from ui.setup_panel import SetupPanel
-from ui.theme import APP_TITLE, APPEARANCE, COLOR_THEME, COLORS, FONT_SMALL, FONT_TITLE
+from ui.theme import APP_NAME, APP_TITLE, APPEARANCE, COLOR_THEME, COLORS, FONT_SMALL, FONT_TITLE
 
 
 class DgHubApp(ctk.CTk):
@@ -48,7 +53,7 @@ class DgHubApp(ctk.CTk):
         side.grid(row=0, column=0, sticky="nsew")
         side.grid_rowconfigure(10, weight=1)
 
-        ctk.CTkLabel(side, text="DG Hub", font=FONT_TITLE).pack(padx=20, pady=(24, 2), anchor="w")
+        ctk.CTkLabel(side, text=APP_NAME, font=FONT_TITLE).pack(padx=20, pady=(24, 2), anchor="w")
         ctk.CTkLabel(
             side,
             text=self.app_state.user.display_name,
@@ -63,11 +68,7 @@ class DgHubApp(ctk.CTk):
         ).pack(padx=20, pady=(0, 20), anchor="w")
 
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
-        for key, label in [
-            ("setup", "Setup"),
-            ("sales", "Sales"),
-            ("design", "Design"),
-        ]:
+        for key, label in visible_nav_pages(self.app_state.user.role):
             btn = ctk.CTkButton(
                 side,
                 text=label,
@@ -97,11 +98,15 @@ class DgHubApp(ctk.CTk):
         self.content.grid_rowconfigure(0, weight=1)
 
         self.pages: dict[str, ctk.CTkFrame] = {}
-        self.pages["setup"] = SetupPanel(self.content, self.app_state, self.auth)
-        self.pages["sales"] = SalesPanel(self.content)
-        self.pages["design"] = DesignPanel(self.content, self.app_state)
+        role = self.app_state.user.role
+        if role in ("admin", "design", "sales"):
+            self.pages["setup"] = SetupPanel(self.content, self.app_state, self.auth)
+        if role in ("admin", "sales"):
+            self.pages["sales"] = SalesPanel(self.content)
+        if role in ("admin", "design"):
+            self.pages["design"] = DesignPanel(self.content, self.app_state)
 
-        self._show_page("design")
+        self._show_page(default_nav_page(role))
 
     def _show_page(self, key: str) -> None:
         for page in self.pages.values():
@@ -114,26 +119,101 @@ class DgHubApp(ctk.CTk):
         self.destroy()
         run_app()
 
+    def show_toast(self, message: str, *, duration_ms: int = 3500) -> None:
+        from ui.toast import show_toast
+
+        show_toast(self, message, duration_ms=duration_ms)
+
+    def schedule_toast(self, message: str, *, duration_ms: int = 3500) -> None:
+        from ui.toast import schedule_toast
+
+        schedule_toast(self, message, duration_ms=duration_ms)
+
+
+def _safe_destroy(window: ctk.CTk | None) -> None:
+    if window is None:
+        return
+    try:
+        if window.winfo_exists():
+            window.destroy()
+    except Exception:
+        pass
+
 
 def run_app() -> None:
     session: list[tuple[AppState, AuthService] | None] = [None]
+    login_ref: list[LoginWindow | None] = [None]
 
     def on_login_ok(state: AppState, auth: AuthService) -> None:
         session[0] = (state, auth)
-        login.quit()
+        _safe_destroy(login_ref[0])
 
     login = LoginWindow(on_success=on_login_ok)
+    login_ref[0] = login
     login.mainloop()
+    login_ref[0] = None
 
     if session[0] is None:
-        login.destroy()
         return
-
-    login.destroy()
     state, auth = session[0]
     state.load_active_ol_into_state()
     state.load_bom_ke_into_state()
+    state.db._ops_notify_callback = state.notify  # noqa: SLF001
+
     app = DgHubApp(state, auth)
+    app_holder: list[DgHubApp | None] = [app]
+
+    def _ops_overwrite_prompt(result, retry_force) -> None:
+        from tkinter import messagebox
+
+        if messagebox.askyesno("Đồng bộ cloud", result.message, parent=app):
+            retry_force()
+        else:
+            app.schedule_toast("Chưa đẩy — cloud có bản mới hơn")
+
+    state.db._ops_overwrite_callback = _ops_overwrite_prompt  # noqa: SLF001
+    state.db._ops_ui_scheduler = lambda fn: app.after(0, fn)  # noqa: SLF001
+
+    def _sync_cloud(app_ref: list[DgHubApp | None]) -> None:
+        try:
+            result = SharedDatasetService(state.db).sync_all_team_data_if_needed()
+            if result and result.ol_result:
+                if app_ref[0]:
+                    app_ref[0].after(0, lambda: state.set_ol_result(result.ol_result))
+            if result and result.bom_result:
+                if app_ref[0]:
+                    app_ref[0].after(0, lambda: state.set_bom_ke_result(result.bom_result))
+            if result:
+                for msg in result.messages:
+                    print(f"[DG Hub] {msg}")
+                for err in result.errors:
+                    print(f"[DG Hub] sync skip: {err}")
+                if app_ref[0] and (result.ops_pulled or result.ops_pushed):
+                    app_ref[0].after(0, state.notify)
+                    if result.ops_pulled:
+                        app_ref[0].schedule_toast("Đã cập nhật từ cloud")
+        except Exception as exc:
+            try:
+                print(f"[DG Hub] sync cloud: {exc}")
+            except UnicodeEncodeError:
+                print(f"[DG Hub] sync cloud: {exc!r}")
+
+    import threading
+    from core.team_ops_sync import TeamOpsSyncResult, start_team_ops_polling
+
+    def _on_ops_poll(result: TeamOpsSyncResult) -> None:
+        if not result.pulled:
+            return
+
+        def _ui() -> None:
+            state.notify()
+            app.show_toast("Đã cập nhật từ cloud")
+
+        app.after(0, _ui)
+
+    threading.Thread(target=_sync_cloud, args=(app_holder,), daemon=True).start()
+    start_team_ops_polling(state.db, on_pulled=_on_ops_poll)
+
     app.mainloop()
 
 

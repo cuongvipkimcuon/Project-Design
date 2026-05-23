@@ -1,6 +1,8 @@
 """Visual theme constants."""
 
-APP_TITLE = "DG Hub — Đề xuất in tem"
+APP_NAME = "DG House"
+APP_VERSION = "1.0"
+APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APPEARANCE = "dark"
 COLOR_THEME = "blue"
 

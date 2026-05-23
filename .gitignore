@@ -7,3 +7,7 @@ __pycache__/
 *.tmp
 ol_cache/
 *.log
+dist/
+build/
+dg_hub.db
+_bom_headers.json

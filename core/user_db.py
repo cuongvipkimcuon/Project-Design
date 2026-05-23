@@ -21,4 +21,7 @@ def create_user_database(
     if cloud.enabled:
         for key, value in cloud.pull_settings().items():
             db.set_setup(key, value, sync_cloud=False)
+        from core.team_ops_sync import migrate_user_ops_to_team
+
+        migrate_user_ops_to_team(db)
     return db

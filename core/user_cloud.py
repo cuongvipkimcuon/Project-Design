@@ -24,6 +24,10 @@ SYNC_SETTING_KEYS = frozenset(
         "ol_active_file_path",
         "supplier_template_path",
         "supplier_template_file_name",
+        "supplier_template_cloud_hash",
+        "supplier_detail_rules_team_hash",
+        "supplier_detail_rules_local",
+        "emg_scanner_cloud_hash",
     }
 )
 

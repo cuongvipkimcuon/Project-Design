@@ -8,6 +8,7 @@ from core.app_state import AppState
 from core.auth import AuthService
 from core.permissions import MOD_SETUP_PERMISSIONS, can_access
 from ui.setup.account_panel import SetupAccountPanel
+from ui.setup.data_status_panel import SetupDataStatusPanel
 from ui.setup.permissions_panel import SetupPermissionsPanel
 from ui.theme import COLORS, FONT_TITLE
 
@@ -33,7 +34,7 @@ class SetupPanel(ctk.CTkFrame):
         tabs = ctk.CTkFrame(header, fg_color="transparent")
         tabs.grid(row=0, column=1)
         self.sub_buttons: dict[str, ctk.CTkButton] = {}
-        sub_defs = [("account", "Tài khoản")]
+        sub_defs = [("account", "Tài khoản"), ("data_status", "Trạng thái dữ liệu")]
         if can_access(state.user.role, MOD_SETUP_PERMISSIONS):
             sub_defs.append(("permissions", "Phân Quyền"))
 
@@ -41,7 +42,7 @@ class SetupPanel(ctk.CTkFrame):
             btn = ctk.CTkButton(
                 tabs,
                 text=label,
-                width=120,
+                width=140 if key == "data_status" else 120,
                 height=32,
                 fg_color="transparent",
                 command=lambda k=key: self._show_sub(k),
@@ -56,6 +57,7 @@ class SetupPanel(ctk.CTkFrame):
 
         self.sub_pages: dict[str, ctk.CTkFrame] = {
             "account": SetupAccountPanel(self.sub_content, state, self.auth),
+            "data_status": SetupDataStatusPanel(self.sub_content, state, self.auth),
         }
         if can_access(state.user.role, MOD_SETUP_PERMISSIONS):
             self.sub_pages["permissions"] = SetupPermissionsPanel(
